@@ -1,13 +1,14 @@
 import type { PluginContext, PluginExports } from '../../plugin-api/index'
-import type { Session, Message, Project, SearchResult } from './types'
-import { listProjects, listSessions, readSession, searchSessions, listRecentSessions, listSkills } from './history'
+import type { Session, Message, Project, SearchResult, FileChange } from './types'
+import { aggregateFileChanges, computeEditDiff, type DiffLine } from './diff'
+import { listProjects, listSessions, readSession, searchSessions, listRecentSessions, listSkills, listDirs } from './history'
 import { createConversation, continueConversation } from './claude'
 import {
   initIcons,
   IconSearch, IconRefresh, IconPlus, IconX, IconChevronRight, IconChevronDown,
   IconArrowLeft, IconSend, IconMenu, IconBrain, IconCopy, IconCheck,
   IconFolder, IconZap, IconHash, IconTerminal, IconFileText, IconPencil,
-  IconEye, IconGlobe, IconSettings, IconMessageSquare, IconSquarePen, IconClaude,
+  IconEye, IconGlobe, IconSettings, IconMessageSquare, IconSquarePen, IconClaude, IconUser,
 } from './icons'
 
 export function activate(ctx: PluginContext): PluginExports {
@@ -30,7 +31,7 @@ export function activate(ctx: PluginContext): PluginExports {
   const loading = ctx.ref(false)
   const costTotal = ctx.ref(0)
   const error = ctx.ref<string | null>(null)
-  const sidebarOpen = ctx.ref(false)
+  const sidebarOpen = ctx.ref(true)
   const sidebarTab = ctx.ref<'history' | 'search'>('history')
   const chatScrollRef = ctx.ref<HTMLElement | null>(null)
   const expandedTools = ctx.ref<Set<string>>(new Set())
@@ -45,6 +46,24 @@ export function activate(ctx: PluginContext): PluginExports {
   const browseSearchOpen = ctx.ref(false)
   const permissionMode = ctx.ref<'default' | 'agent' | 'plan'>('default')
   const thinkingEnabled = ctx.ref(false)
+  const stopRequested = ctx.ref(false)
+  const changesPanelOpen = ctx.ref(false)
+  const expandedFiles = ctx.ref<Set<string>>(new Set())
+  const currentCwd = ctx.ref<string | null>(null)
+  const showProjectPicker = ctx.ref(false)
+  const pickerCurrentDir = ctx.ref('/')
+  const pickerEntries = ctx.ref<{ name: string; path: string }[]>([])
+  const pickerLoading = ctx.ref(false)
+
+  // --- Computed ---
+  const fileChanges = ctx.computed(() => aggregateFileChanges(messages.value))
+
+  // Auto-expand all files when changes appear
+  ctx.watch(fileChanges, (changes) => {
+    if (changes.length > 0) {
+      expandedFiles.value = new Set(changes.map(c => c.filePath))
+    }
+  })
 
   // --- Slash commands ---
   interface SlashCmd { name: string; desc: string; action: () => void }
@@ -54,6 +73,7 @@ export function activate(ctx: PluginContext): PluginExports {
     { name: '/history', desc: 'Show conversation history', action: () => { sidebarOpen.value = true; sidebarTab.value = 'history'; loadProjects() } },
     { name: '/search', desc: 'Search conversations', action: () => { sidebarOpen.value = true; sidebarTab.value = 'search' } },
     { name: '/skills', desc: 'List available skills', action: loadAndShowSkills },
+    { name: '/cwd', desc: 'Show or set working directory', action: showCwdInfo },
     { name: '/clear', desc: 'Clear current messages', action: () => { messages.value = []; error.value = null } },
     { name: '/cost', desc: 'Show total cost', action: () => { error.value = costTotal.value > 0 ? `Total cost: $${costTotal.value.toFixed(4)}` : 'No cost yet' } },
     { name: '/help', desc: 'Show available commands', action: () => { error.value = null; showCmdPalette.value = true; cmdFilter.value = '' } },
@@ -85,6 +105,35 @@ export function activate(ctx: PluginContext): PluginExports {
     )
   }
 
+  async function showCwdInfo() {
+    showProjectPicker.value = true
+    const startDir = currentCwd.value || '~'
+    pickerCurrentDir.value = startDir
+    await loadPickerDirs(startDir)
+  }
+
+  async function loadPickerDirs(dir: string) {
+    pickerLoading.value = true
+    try {
+      pickerEntries.value = await listDirs(exec, dir)
+    } catch {
+      pickerEntries.value = []
+    } finally {
+      pickerLoading.value = false
+    }
+  }
+
+  async function navigatePickerDir(dir: string) {
+    pickerCurrentDir.value = dir
+    await loadPickerDirs(dir)
+  }
+
+  function selectProjectPath(p: string) {
+    currentCwd.value = p
+    showProjectPicker.value = false
+    ctx.storage.set('cwd', p).catch(() => {})
+  }
+
   function cyclePermissionMode() {
     const modes: Array<'default' | 'agent' | 'plan'> = ['default', 'agent', 'plan']
     const idx = modes.indexOf(permissionMode.value)
@@ -109,7 +158,16 @@ export function activate(ctx: PluginContext): PluginExports {
 
   function getFilteredCmds(): SlashCmd[] {
     const f = cmdFilter.value.toLowerCase()
-    return f ? slashCommands.filter(c => c.name.includes(f) || c.desc.toLowerCase().includes(f)) : slashCommands
+    // Merge built-in commands with loaded skills
+    const allCmds: SlashCmd[] = [
+      ...slashCommands,
+      ...skillsList.value.map(s => ({
+        name: `/${s.id}`,
+        desc: s.description || s.name,
+        action: () => useSkill(s),
+      })),
+    ]
+    return f ? allCmds.filter(c => c.name.includes(f) || c.desc.toLowerCase().includes(f)) : allCmds
   }
 
   function execCmd(cmd: SlashCmd) {
@@ -231,6 +289,10 @@ export function activate(ctx: PluginContext): PluginExports {
     error.value = null
     messages.value = []
     expandedTools.value = new Set()
+    // Set working directory from session project
+    if (session.project && session.project !== '.') {
+      currentCwd.value = session.project
+    }
     try {
       messages.value = await readSession(exec, session.encodedPath, session.id)
       scrollToBottom()
@@ -241,7 +303,7 @@ export function activate(ctx: PluginContext): PluginExports {
     }
   }
 
-  function startNewChat() {
+  async function startNewChat() {
     activeSession.value = null
     messages.value = []
     inputText.value = ''
@@ -250,6 +312,13 @@ export function activate(ctx: PluginContext): PluginExports {
     expandedTools.value = new Set()
     view.value = 'chat'
     sidebarOpen.value = false
+    // Load saved CWD from storage
+    if (!currentCwd.value) {
+      try {
+        const saved = await ctx.storage.get<string>('cwd')
+        if (saved) currentCwd.value = saved
+      } catch { /* skip */ }
+    }
   }
 
   async function doSearch() {
@@ -266,11 +335,17 @@ export function activate(ctx: PluginContext): PluginExports {
     }
   }
 
+  function stopSending() {
+    stopRequested.value = true
+    sending.value = false
+  }
+
   async function sendMessage() {
     const text = inputText.value.trim()
     if (!text || sending.value) return
 
     sending.value = true
+    stopRequested.value = false
     error.value = null
 
     const userMsg: Message = {
@@ -284,9 +359,11 @@ export function activate(ctx: PluginContext): PluginExports {
     scrollToBottom()
 
     try {
-      const cwd = await getActiveCwd()
+      const cwd = currentCwd.value || await getActiveCwd()
+      if (stopRequested.value) return
       if (activeSession.value) {
         const result = await continueConversation(exec, activeSession.value.id, text, { cwd })
+        if (stopRequested.value) return
         costTotal.value += result.costUsd
         messages.value = [...messages.value, {
           uuid: 'resp-' + Date.now(),
@@ -296,8 +373,9 @@ export function activate(ctx: PluginContext): PluginExports {
         }]
       } else {
         const result = await createConversation(exec, text, { cwd })
+        if (stopRequested.value) return
         costTotal.value += result.costUsd
-        const projectPath = selectedProject.value || cwd || '.'
+        const projectPath = selectedProject.value || cwd || currentCwd.value || '.'
         activeSession.value = {
           id: result.sessionId,
           project: projectPath,
@@ -315,10 +393,13 @@ export function activate(ctx: PluginContext): PluginExports {
       }
       scrollToBottom()
     } catch (e: any) {
-      error.value = e.message
-      messages.value = messages.value.filter(m => !m.uuid.startsWith('pending-'))
+      if (!stopRequested.value) {
+        error.value = e.message
+        messages.value = messages.value.filter(m => !m.uuid.startsWith('pending-'))
+      }
     } finally {
       sending.value = false
+      stopRequested.value = false
     }
   }
 
@@ -399,6 +480,11 @@ export function activate(ctx: PluginContext): PluginExports {
       ]),
       h('div', { class: 'ccm-header-right' }, [
         costTotal.value > 0 ? h('span', { class: 'ccm-cost-badge' }, `$${costTotal.value.toFixed(3)}`) : null,
+        fileChanges.value.length > 0 ? h('button', {
+          class: `ccm-icon-btn ${changesPanelOpen.value ? 'ccm-icon-btn-active' : ''}`,
+          onClick: () => { changesPanelOpen.value = !changesPanelOpen.value },
+          title: `${fileChanges.value.length} changed files`,
+        }, IconFileText(15)) : null,
         h('button', {
           class: 'ccm-icon-btn',
           onClick: startNewChat,
@@ -409,28 +495,25 @@ export function activate(ctx: PluginContext): PluginExports {
   }
 
   function renderSidebar() {
-    if (!sidebarOpen.value) return null
-    return h('div', { class: 'ccm-sidebar-overlay' }, [
-      h('div', { class: 'ccm-sidebar' }, [
-        h('div', { class: 'ccm-sidebar-header' }, [
-          h('div', { class: 'ccm-sidebar-tabs' }, [
-            h('button', {
-              class: `ccm-sidebar-tab ${sidebarTab.value === 'history' ? 'ccm-sidebar-tab-active' : ''}`,
-              onClick: () => { sidebarTab.value = 'history' },
-            }, 'History'),
-            h('button', {
-              class: `ccm-sidebar-tab ${sidebarTab.value === 'search' ? 'ccm-sidebar-tab-active' : ''}`,
-              onClick: () => { sidebarTab.value = 'search' },
-            }, 'Search'),
-          ]),
+    return h('div', { class: 'ccm-sidebar' }, [
+      h('div', { class: 'ccm-sidebar-header' }, [
+        h('div', { class: 'ccm-sidebar-tabs' }, [
           h('button', {
-            class: 'ccm-icon-btn ccm-icon-btn-sm',
-            onClick: () => { sidebarOpen.value = false },
-          }, IconX(14)),
+            class: `ccm-sidebar-tab ${sidebarTab.value === 'history' ? 'ccm-sidebar-tab-active' : ''}`,
+            onClick: () => { sidebarTab.value = 'history' },
+          }, 'History'),
+          h('button', {
+            class: `ccm-sidebar-tab ${sidebarTab.value === 'search' ? 'ccm-sidebar-tab-active' : ''}`,
+            onClick: () => { sidebarTab.value = 'search' },
+          }, 'Search'),
         ]),
-        sidebarTab.value === 'history' ? renderHistoryPanel() : renderSearchPanel(),
+        h('button', {
+          class: 'ccm-icon-btn ccm-icon-btn-sm',
+          onClick: startNewChat,
+          title: 'New conversation',
+        }, IconPlus()),
       ]),
-      h('div', { class: 'ccm-sidebar-backdrop', onClick: () => { sidebarOpen.value = false } }),
+      sidebarTab.value === 'history' ? renderHistoryPanel() : renderSearchPanel(),
     ])
   }
 
@@ -522,9 +605,16 @@ export function activate(ctx: PluginContext): PluginExports {
 
   function renderTypingIndicator() {
     return h('div', { class: 'ccm-typing' }, [
-      h('div', { class: 'ccm-typing-dot' }),
-      h('div', { class: 'ccm-typing-dot' }),
-      h('div', { class: 'ccm-typing-dot' }),
+      h('div', { class: 'ccm-typing-dots' }, [
+        h('div', { class: 'ccm-typing-dot' }),
+        h('div', { class: 'ccm-typing-dot' }),
+        h('div', { class: 'ccm-typing-dot' }),
+      ]),
+      h('button', {
+        class: 'ccm-stop-btn',
+        onClick: stopSending,
+        title: 'Stop generating',
+      }, 'Stop'),
     ])
   }
 
@@ -537,7 +627,7 @@ export function activate(ctx: PluginContext): PluginExports {
       showDivider ? h('div', { class: 'ccm-divider' }) : null,
       h('div', { class: 'ccm-message-gutter' }, [
         h('div', { class: `ccm-avatar ${isUser ? 'ccm-avatar-user' : 'ccm-avatar-assistant'}` },
-          isUser ? 'U' : '✦'
+          isUser ? IconUser(16) : IconClaude(16)
         ),
       ]),
       h('div', { class: 'ccm-message-body' }, [
@@ -650,8 +740,189 @@ export function activate(ctx: PluginContext): PluginExports {
           }, sending.value ? h('span', { class: 'ccm-spinner ccm-spinner-sm' }) : IconSend(16)),
         ]),
       ]),
-      h('div', { class: 'ccm-input-hint' }, 'Shift+Enter for new line  |  / for commands'),
+      h('div', { class: 'ccm-input-hint' }, [
+        h('span', {
+          class: 'ccm-cwd-badge',
+          title: currentCwd.value ? `Click to change: ${currentCwd.value}` : 'Click to set project directory',
+          onClick: showCwdInfo,
+        }, [
+          IconFolder(12),
+          h('span', null, currentCwd.value ? (currentCwd.value.split('/').pop() || currentCwd.value) : 'Set project'),
+        ]),
+        h('span', null, 'Shift+Enter for new line  |  / for commands'),
+      ]),
     ])
+  }
+
+  // ===== File Changes Panel =====
+
+  function renderChangesPanel() {
+    const changes = fileChanges.value
+    const totalAdditions = changes.reduce((sum, c) => sum + c.additions, 0)
+    const totalDeletions = changes.reduce((sum, c) => sum + c.deletions, 0)
+
+    return h('div', { class: 'ccm-changes-panel' }, [
+      h('div', { class: 'ccm-changes-header' }, [
+        h('div', { class: 'ccm-changes-header-left' }, [
+          h('span', { class: 'ccm-changes-title' }, `${changes.length} changed files`),
+          renderDiffChanges(totalAdditions, totalDeletions, 'default'),
+        ]),
+        h('button', {
+          class: 'ccm-icon-btn ccm-icon-btn-sm',
+          onClick: () => { changesPanelOpen.value = false },
+          title: 'Close panel',
+        }, IconX(14)),
+      ]),
+      h('div', { class: 'ccm-changes-list' },
+        changes.map(change => renderFileChangeItem(change))
+      ),
+    ])
+  }
+
+  function renderDiffChanges(additions: number, deletions: number, variant: 'default' | 'bars' = 'default') {
+    if (variant === 'bars') {
+      const TOTAL_BLOCKS = 5
+      const total = additions + deletions
+      let addBlocks = 0
+      let delBlocks = 0
+
+      if (total > 0) {
+        if (total < 5) {
+          addBlocks = additions > 0 ? 1 : 0
+          delBlocks = deletions > 0 ? 1 : 0
+        } else {
+          const ratio = additions / total
+          addBlocks = Math.max(1, Math.round(ratio * TOTAL_BLOCKS))
+          delBlocks = TOTAL_BLOCKS - addBlocks
+        }
+      }
+
+      return h('div', { class: 'ccm-diff-bars' }, [
+        ...Array.from({ length: addBlocks }, (_, i) =>
+          h('span', { class: 'ccm-diff-bar ccm-diff-bar-add', key: `a${i}` })
+        ),
+        ...Array.from({ length: delBlocks }, (_, i) =>
+          h('span', { class: 'ccm-diff-bar ccm-diff-bar-del', key: `d${i}` })
+        ),
+      ])
+    }
+
+    return h('span', { class: 'ccm-diff-changes' }, [
+      additions > 0 ? h('span', { class: 'ccm-diff-add' }, `+${additions}`) : null,
+      deletions > 0 ? h('span', { class: 'ccm-diff-del' }, `-${deletions}`) : null,
+    ].filter(Boolean))
+  }
+
+  function renderFileChangeItem(change: FileChange) {
+    const expanded = expandedFiles.value.has(change.filePath)
+    const fileName = change.filePath.split('/').pop() || change.filePath
+    const dirPath = change.filePath.slice(0, change.filePath.lastIndexOf('/'))
+
+    return h('div', { class: `ccm-change-item ${expanded ? 'ccm-change-item-expanded' : ''}` }, [
+      h('div', {
+        class: 'ccm-change-header',
+        onClick: () => {
+          const next = new Set(expandedFiles.value)
+          if (next.has(change.filePath)) next.delete(change.filePath)
+          else next.add(change.filePath)
+          expandedFiles.value = next
+        },
+      }, [
+        h('span', { class: 'ccm-change-chevron' },
+          expanded ? IconChevronDown(12) : IconChevronRight(12)
+        ),
+        h('span', { class: 'ccm-change-icon' }, IconFileText(14)),
+        h('div', { class: 'ccm-change-info' }, [
+          h('span', { class: 'ccm-change-filename' }, fileName),
+          h('span', { class: 'ccm-change-dir' }, dirPath),
+        ]),
+        renderDiffChanges(change.additions, change.deletions, 'bars'),
+      ]),
+      expanded ? renderFileDiff(change) : null,
+    ])
+  }
+
+  function renderFileDiff(change: FileChange) {
+    const operations: DiffLine[] = []
+
+    for (const msg of messages.value) {
+      if (!msg.toolUses) continue
+      for (const tu of msg.toolUses) {
+        if (tu.filePath !== change.filePath) continue
+        if (tu.name === 'Edit' && tu.oldString !== undefined && tu.newString !== undefined) {
+          operations.push(...computeEditDiff(tu.oldString, tu.newString))
+        } else if (tu.name === 'Write' && tu.content !== undefined) {
+          const lines = tu.content.split('\n')
+          for (const line of lines) {
+            operations.push({ type: 'add', text: line })
+          }
+        }
+      }
+    }
+
+    return h('div', { class: 'ccm-change-diff' },
+      operations.map((line, i) =>
+        h('div', {
+          class: `ccm-diff-line ${line.type === 'add' ? 'ccm-diff-line-add' : line.type === 'del' ? 'ccm-diff-line-del' : 'ccm-diff-line-ctx'}`,
+          key: i,
+        }, [
+          h('span', { class: 'ccm-diff-prefix' }, line.type === 'add' ? '+' : line.type === 'del' ? '-' : ' '),
+          h('span', { class: 'ccm-diff-text' }, line.text),
+        ])
+      )
+    )
+  }
+
+  function renderStatusBar() {
+    return h('div', { class: 'ccm-statusbar' }, [
+      h('div', { class: 'ccm-statusbar-left' }, [
+        h('span', { class: 'ccm-statusbar-item' }, [
+          IconClaude(12),
+          h('span', null, ' Claude Code'),
+        ]),
+        activeSession.value ? h('span', { class: 'ccm-statusbar-sep' }, '|') : null,
+        activeSession.value ? h('span', { class: 'ccm-statusbar-item ccm-statusbar-muted' },
+          activeSession.value.project?.split('/').pop() || ''
+        ) : null,
+      ]),
+      h('div', { class: 'ccm-statusbar-right' }, [
+        messages.value.length > 0 ? h('span', { class: 'ccm-statusbar-item ccm-statusbar-muted' },
+          `${messages.value.length} messages`
+        ) : null,
+        costTotal.value > 0 ? h('span', { class: 'ccm-statusbar-item ccm-statusbar-cost' },
+          `$${costTotal.value.toFixed(4)}`
+        ) : null,
+        sending.value ? h('span', { class: 'ccm-statusbar-item ccm-statusbar-active' }, [
+          h('span', { class: 'ccm-spinner ccm-spinner-xs' }),
+          h('span', null, 'thinking'),
+        ]) : null,
+      ]),
+    ])
+  }
+
+  // --- Keyboard shortcuts ---
+  function handleGlobalKeydown(e: KeyboardEvent) {
+    const mod = e.metaKey || e.ctrlKey
+    if (mod && e.key === 'b') {
+      e.preventDefault()
+      sidebarOpen.value = !sidebarOpen.value
+    }
+    if (mod && e.key === 'n') {
+      e.preventDefault()
+      startNewChat()
+    }
+    if (mod && e.key === 'k') {
+      e.preventDefault()
+      showCmdPalette.value = !showCmdPalette.value
+      cmdFilter.value = ''
+      cmdSelectedIdx.value = 0
+    }
+    if (mod && e.key === 'd') {
+      e.preventDefault()
+      if (fileChanges.value.length > 0) {
+        changesPanelOpen.value = !changesPanelOpen.value
+      }
+    }
   }
 
   function renderCommandPalette() {
@@ -679,7 +950,9 @@ export function activate(ctx: PluginContext): PluginExports {
 
   function renderMarkdown(content: string): any[] {
     if (!content) return [h('span', { class: 'ccm-muted' }, '(no content)')]
-    const lines = content.split('\n')
+    // Strip Claude Code command tags
+    const cleaned = content.replace(/<\/?command-(?:message|name)[^>]*>/g, '')
+    const lines = cleaned.split('\n')
     const elements: any[] = []
     let inCode = false
     let codeLines: string[] = []
@@ -819,6 +1092,9 @@ export function activate(ctx: PluginContext): PluginExports {
           console.log('[claude-code] onMounted called')
           loadRecentSessions()
           loadProjects()
+          // Pre-load skills for slash command palette
+          listSkills(exec).then(s => { skillsList.value = s }).catch(() => {})
+          document.addEventListener('keydown', handleGlobalKeydown)
         })
         return {}
       },
@@ -826,9 +1102,16 @@ export function activate(ctx: PluginContext): PluginExports {
         return h('div', { class: 'ccm-root' }, [
           renderHeader(),
           h('div', { class: 'ccm-main' }, [
-            renderSidebar(),
-            view.value === 'browse' ? renderBrowseView() : renderChat(),
+            sidebarOpen.value ? renderSidebar() : null,
+            h('div', { class: 'ccm-content' }, [
+              view.value === 'browse' ? renderBrowseView() : renderChat(),
+            ]),
+            (view.value === 'chat' && changesPanelOpen.value && fileChanges.value.length > 0)
+              ? renderChangesPanel()
+              : null,
           ]),
+          renderStatusBar(),
+          showProjectPicker.value ? renderProjectPicker() : null,
           showSkillsPanel.value ? renderSkillsPanel() : null,
         ])
       },
@@ -924,9 +1207,87 @@ export function activate(ctx: PluginContext): PluginExports {
     ])
   }
 
+  // ===== Project Path Picker =====
+
+  function renderProjectPicker() {
+    const dir = pickerCurrentDir.value
+    const entries = pickerEntries.value
+    const detected = currentCwd.value
+
+    // Breadcrumb segments
+    const segments = dir.split('/').filter(Boolean)
+    const breadcrumbs: any[] = [
+      h('span', {
+        class: 'ccm-picker-crumb',
+        onClick: () => navigatePickerDir('/'),
+      }, '/'),
+    ]
+    let accumulated = ''
+    for (const seg of segments) {
+      accumulated += '/' + seg
+      const path = accumulated
+      breadcrumbs.push(h('span', { class: 'ccm-picker-crumb-sep' }, '/'))
+      breadcrumbs.push(h('span', {
+        class: 'ccm-picker-crumb',
+        onClick: () => navigatePickerDir(path),
+      }, seg))
+    }
+
+    return h('div', { class: 'ccm-picker-overlay' }, [
+      h('div', { class: 'ccm-picker-backdrop', onClick: () => { showProjectPicker.value = false } }),
+      h('div', { class: 'ccm-picker-panel' }, [
+        h('div', { class: 'ccm-picker-header' }, [
+          h('span', { class: 'ccm-picker-title' }, 'Select Project Directory'),
+          h('button', {
+            class: 'ccm-icon-btn ccm-icon-btn-sm',
+            onClick: () => { showProjectPicker.value = false },
+          }, IconX(14)),
+        ]),
+        // Breadcrumb
+        h('div', { class: 'ccm-picker-breadcrumb' }, breadcrumbs),
+        // Current CWD indicator
+        detected ? h('div', { class: 'ccm-picker-current' }, [
+          IconFolder(14),
+          h('span', null, `Current: ${detected}`),
+        ]) : null,
+        // Select current directory button
+        h('div', { class: 'ccm-picker-actions' }, [
+          h('button', {
+            class: 'ccm-picker-action-btn',
+            onClick: () => selectProjectPath(dir),
+          }, [
+            IconCheck(14),
+            h('span', null, `Select "${dir.split('/').pop() || '/'}"`),
+          ]),
+        ]),
+        // Directory list
+        h('div', { class: 'ccm-picker-list' },
+          pickerLoading.value
+            ? h('div', { class: 'ccm-picker-empty' }, [
+                h('span', { class: 'ccm-spinner' }),
+              ])
+            : entries.length > 0
+              ? entries.map(entry => h('div', {
+                  class: 'ccm-picker-item',
+                  onClick: () => navigatePickerDir(entry.path),
+                }, [
+                  IconFolder(14),
+                  h('div', { class: 'ccm-picker-item-info' }, [
+                    h('span', { class: 'ccm-picker-item-name' }, entry.name),
+                    h('span', { class: 'ccm-picker-item-path' }, entry.path),
+                  ]),
+                  IconChevronRight(14),
+                ]))
+              : h('div', { class: 'ccm-picker-empty' }, 'No subdirectories')
+        ),
+      ]),
+    ])
+  }
+
   function renderSkillsPanel() {
     const selected = skillsList.value.find(s => s.id === selectedSkillId.value)
     return h('div', { class: 'ccm-skills-overlay' }, [
+      h('div', { class: 'ccm-skills-backdrop', onClick: () => { showSkillsPanel.value = false; selectedSkillId.value = null } }),
       h('div', { class: 'ccm-skills-panel' }, [
         h('div', { class: 'ccm-skills-header' }, [
           h('div', { class: 'ccm-skills-header-left' }, [
@@ -944,7 +1305,6 @@ export function activate(ctx: PluginContext): PluginExports {
         ]),
         selected ? renderSkillDetail(selected) : renderSkillsList(),
       ]),
-      h('div', { class: 'ccm-skills-backdrop', onClick: () => { showSkillsPanel.value = false; selectedSkillId.value = null } }),
     ])
   }
 

@@ -75,6 +75,10 @@ const ICON_PATHS: Record<string, [string, Record<string, string>][]> = {
   'message-square': [
     ['path', { d: 'M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z' }],
   ],
+  'user': [
+    ['path', { d: 'M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2' }],
+    ['circle', { cx: '12', cy: '7', r: '4' }],
+  ],
   'square-pen': [
     ['path', { d: 'M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7' }],
     ['path', { d: 'M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z' }],
@@ -141,6 +145,7 @@ export function IconGlobe(size?: number) { return renderIcon(ICON_PATHS.globe, s
 export function IconSettings(size?: number) { return renderIcon(ICON_PATHS.settings, size) }
 export function IconMessageSquare(size?: number) { return renderIcon(ICON_PATHS['message-square'], size) }
 export function IconSquarePen(size?: number) { return renderIcon(ICON_PATHS['square-pen'], size) }
+export function IconUser(size?: number) { return renderIcon(ICON_PATHS['user'], size) }
 
 // ClaudeCode icon from lobe-icons (fill-based, not stroke)
 export function IconClaude(size?: number, cls?: string) { return renderFillIcon(CLAUDE_CODE_PATH, size, cls) }

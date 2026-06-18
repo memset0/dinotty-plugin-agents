@@ -20,6 +20,18 @@ export interface Message {
 export interface ToolUse {
   name: string
   summary: string
+  filePath?: string
+  oldString?: string
+  newString?: string
+  content?: string
+  replaceAll?: boolean
+}
+
+export interface FileChange {
+  filePath: string
+  additions: number
+  deletions: number
+  toolType: 'Edit' | 'Write'
 }
 
 export interface Project {

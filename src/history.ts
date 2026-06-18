@@ -39,3 +39,9 @@ export async function listSkills(exec: ExecFn): Promise<SkillInfo[]> {
   if (res.code !== 0) throw new Error(res.stderr || 'list-skills failed')
   return JSON.parse(res.stdout)
 }
+
+export async function listDirs(exec: ExecFn, dirPath: string): Promise<{ name: string; path: string }[]> {
+  const res = await exec(['list-dirs', dirPath], { timeout: 5_000 })
+  if (res.code !== 0) return []
+  try { return JSON.parse(res.stdout) } catch { return [] }
+}

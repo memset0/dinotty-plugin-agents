@@ -1,16 +1,59 @@
 import * as fs from 'fs'
 import * as path from 'path'
-import { execFile } from 'child_process'
+import { execFile, execFileSync } from 'child_process'
 
 // --- Paths ---
 const HOME = process.env.HOME || '/root'
 const CLAUDE_DIR = path.join(HOME, '.claude')
 const PROJECTS_DIR = path.join(CLAUDE_DIR, 'projects')
 
+// --- Find claude binary (same issue as nvm node path) ---
+function findClaude(): string {
+  // 1. Try PATH first
+  try {
+    return execFileSync('which', ['claude'], { encoding: 'utf-8' }).trim()
+  } catch { /* not in PATH */ }
+
+  // 2. Check nvm default version's global bin
+  const nvmDefault = path.join(HOME, '.nvm/alias/default')
+  if (fs.existsSync(nvmDefault)) {
+    const version = fs.readFileSync(nvmDefault, 'utf-8').trim()
+    if (version) {
+      const nvmClaude = path.join(HOME, `.nvm/versions/node/${version}/bin/claude`)
+      if (fs.existsSync(nvmClaude)) return nvmClaude
+    }
+  }
+
+  // 3. Scan nvm versions for claude
+  const nvmVersionsDir = path.join(HOME, '.nvm/versions/node')
+  if (fs.existsSync(nvmVersionsDir)) {
+    try {
+      const versions = fs.readdirSync(nvmVersionsDir).sort().reverse()
+      for (const v of versions) {
+        const candidate = path.join(nvmVersionsDir, v, 'bin/claude')
+        if (fs.existsSync(candidate)) return candidate
+      }
+    } catch { /* skip */ }
+  }
+
+  // 4. Common locations
+  const candidates = [
+    '/usr/local/bin/claude',
+    '/opt/homebrew/bin/claude',
+    path.join(HOME, '.local/bin/claude'),
+  ]
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c
+  }
+
+  // 5. Fallback — hope it's in PATH at runtime
+  return 'claude'
+}
+
 // --- Types ---
 interface Project { path: string; encodedPath: string; sessionCount: number }
 interface Session { id: string; project: string; encodedPath: string; firstPrompt: string; lastTimestamp: string; messageCount: number; gitBranch?: string }
-interface Message { uuid: string; role: 'user' | 'assistant'; content: string; timestamp: string; model?: string; toolUses?: { name: string; summary: string }[] }
+interface Message { uuid: string; role: 'user' | 'assistant'; content: string; timestamp: string; model?: string; toolUses?: { name: string; summary: string; filePath?: string; oldString?: string; newString?: string; content?: string; replaceAll?: boolean }[] }
 interface SearchResult { session: Session; match: string }
 
 // --- Helpers ---
@@ -98,12 +141,25 @@ function parseMessage(obj: any): Message | null {
   if (obj.type === 'assistant') {
     const content = obj.message?.content || []
     const textParts: string[] = []
-    const toolUses: { name: string; summary: string }[] = []
+    const toolUses: { name: string; summary: string; filePath?: string; oldString?: string; newString?: string; content?: string; replaceAll?: boolean }[] = []
 
     for (const block of content) {
       if (block.type === 'text') textParts.push(block.text)
       else if (block.type === 'tool_use') {
-        toolUses.push({ name: block.name, summary: summarizeTool(block.name, block.input) })
+        const tu: { name: string; summary: string; filePath?: string; oldString?: string; newString?: string; content?: string; replaceAll?: boolean } = {
+          name: block.name,
+          summary: summarizeTool(block.name, block.input),
+        }
+        if (block.name === 'Edit' && block.input) {
+          tu.filePath = block.input.file_path || ''
+          tu.oldString = block.input.old_string || ''
+          tu.newString = block.input.new_string || ''
+          tu.replaceAll = block.input.replace_all || false
+        } else if (block.name === 'Write' && block.input) {
+          tu.filePath = block.input.file_path || ''
+          tu.content = block.input.content || ''
+        }
+        toolUses.push(tu)
       }
     }
 
@@ -418,7 +474,8 @@ function cmdClaudeCall(args: string[]) {
     claudeArgs.push('--resume', sessionId)
   }
 
-  execFile('claude', claudeArgs, { timeout: 300_000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+  const claudeBin = findClaude()
+  execFile(claudeBin, claudeArgs, { timeout: 300_000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
     if (err) {
       console.error(stderr || err.message)
       process.exit(1)
@@ -439,6 +496,28 @@ function cmdClaudeCall(args: string[]) {
       }))
     }
   })
+}
+
+function cmdListDirs(dirPath: string) {
+  const resolved = dirPath.replace(/^~/, HOME)
+  try {
+    const stat = fs.statSync(resolved)
+    if (!stat.isDirectory()) { console.log('[]'); return }
+  } catch { console.log('[]'); return }
+
+  try {
+    const entries = fs.readdirSync(resolved, { withFileTypes: true })
+    const dirs: { name: string; path: string }[] = []
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      if (entry.name.startsWith('.') && entry.name !== '.claude') continue
+      dirs.push({ name: entry.name, path: path.join(resolved, entry.name) })
+    }
+    dirs.sort((a, b) => a.name.localeCompare(b.name))
+    console.log(JSON.stringify(dirs))
+  } catch {
+    console.log('[]')
+  }
 }
 
 // --- Main ---
@@ -469,8 +548,12 @@ switch (subcommand) {
   case 'claude-call':
     cmdClaudeCall(args)
     break
+  case 'list-dirs':
+    if (!args[0]) { console.error('Usage: list-dirs <path>'); process.exit(1) }
+    cmdListDirs(args[0])
+    break
   default:
     console.error(`Unknown subcommand: ${subcommand}`)
-    console.error('Available: list-projects, list-sessions, read-session, search, list-recent, list-skills, claude-call')
+    console.error('Available: list-projects, list-sessions, read-session, search, list-recent, list-skills, claude-call, list-dirs')
     process.exit(1)
 }

@@ -6,7 +6,7 @@
   "description_zh": "Claude Code 可视化对话管理 — 浏览历史、新建和恢复会话",
   "icon": "message-square",
   "entry": "./dist/main.js",
-  "bin": { "mode": "cli", "entry": "dist/cli" },
+  "bin": { "mode": "cli", "entry": "dist/cli-wrapper" },
   "styles": "./styles.css",
   "commands": [
     { "id": "claude-code.open", "title": "Open Claude Code" },
