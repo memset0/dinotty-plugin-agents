@@ -113,6 +113,7 @@ export function activate(ctx: PluginContext): PluginExports {
     const q = browseSearch.value.trim().toLowerCase()
     if (!q) return recentSessions.value
     return recentSessions.value.filter(s =>
+      (s.name || '').toLowerCase().includes(q) ||
       (s.firstPrompt || '').toLowerCase().includes(q) ||
       (s.project || '').toLowerCase().includes(q) ||
       (s.gitBranch || '').toLowerCase().includes(q)
@@ -713,7 +714,7 @@ export function activate(ctx: PluginContext): PluginExports {
     async items() {
       const recent = await listRecentSessions(exec, 20)
       return recent.map(s => ({
-        label: s.firstPrompt.slice(0, 60) || '(empty)',
+        label: (s.name || s.firstPrompt || '').slice(0, 60) || '(empty)',
         detail: `${s.project} · ${formatTime(s.lastTimestamp)}`,
         icon: '💬',
         action() { openSession(s) },
@@ -733,7 +734,7 @@ export function activate(ctx: PluginContext): PluginExports {
         }, IconMenu()),
         h('span', { class: 'ccm-header-title' },
           activeSession.value
-            ? (activeSession.value.firstPrompt?.slice(0, 60) || 'Session')
+            ? (activeSession.value.name || activeSession.value.firstPrompt?.slice(0, 60) || 'Session')
             : (view.value === 'chat' ? 'New Chat' : 'Agents View')
         ),
       ]),
@@ -834,7 +835,7 @@ export function activate(ctx: PluginContext): PluginExports {
         class: 'ccm-session-row',
         onClick: () => openSession(r.session),
       }, [
-        h('div', { class: 'ccm-session-text' }, r.session.firstPrompt.slice(0, 50)),
+        h('div', { class: 'ccm-session-text' }, (r.session.name || r.session.firstPrompt || '').slice(0, 50)),
         h('div', { class: 'ccm-search-snippet' }, r.match.slice(0, 80)),
         h('div', { class: 'ccm-session-info' }, [
           srcBadge(r.session.source),
