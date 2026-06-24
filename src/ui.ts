@@ -790,7 +790,7 @@ export function activate(ctx: PluginContext): PluginExports {
           h('span', { class: 'ccm-project-chevron' }, selectedProject.value === p.path ? IconChevronDown(12) : IconChevronRight(12)),
           h('span', { class: 'ccm-project-icon' }, IconFolder(14)),
           h('span', { class: 'ccm-project-label' }, p.path.split('/').pop() || p.path),
-          h('span', { class: 'ccm-project-count', style: 'opacity:.5;font-size:11px;margin-left:4px;font-variant-numeric:tabular-nums' }, `(${p.sessionCount})`),
+          h('span', { style: 'opacity:.5;font-size:11px;margin-left:5px;font-variant-numeric:tabular-nums;flex:0 0 auto' }, `(${p.sessionCount})`),
           h('span', { style: 'margin-left:auto;display:flex;align-items:center' }, starBtn(favProjects.value.has(p.path), () => toggleFavProject(p.path))),
         ]),
         selectedProject.value === p.path ? h('div', { class: 'ccm-session-list' },
@@ -1534,24 +1534,26 @@ export function activate(ctx: PluginContext): PluginExports {
   }
 
   function renderSessionCard(s: Session) {
+    // Keep the card's native layout (header row + meta row stacked); overlay the
+    // star at the right-center via absolute positioning, with right padding so
+    // content doesn't run under it.
     return h('div', {
       class: 'ccm-session-card',
-      style: 'display:flex;align-items:center;gap:8px',
+      style: 'position:relative;padding-right:30px',
       onClick: () => openSession(s),
     }, [
-      h('div', { style: 'flex:1;min-width:0' }, [
-        h('div', { class: 'ccm-session-card-header' }, [
-          h('span', { class: 'ccm-session-card-title' }, (s.name || s.firstPrompt || '').slice(0, 80) || '(empty)'),
-          h('span', { class: 'ccm-session-card-time' }, formatTime(s.lastTimestamp)),
-        ]),
-        h('div', { class: 'ccm-session-card-meta' }, [
-          srcBadge(s.source),
-          h('span', { class: 'ccm-session-card-count' }, `${s.messageCount} messages`),
-          h('span', { class: 'ccm-tag' }, s.project.split('/').pop() || s.project),
-          s.gitBranch ? h('span', { class: 'ccm-tag' }, s.gitBranch) : null,
-        ].filter(Boolean)),
+      h('div', { class: 'ccm-session-card-header' }, [
+        h('span', { class: 'ccm-session-card-title' }, (s.name || s.firstPrompt || '').slice(0, 80) || '(empty)'),
+        h('span', { class: 'ccm-session-card-time' }, formatTime(s.lastTimestamp)),
       ]),
-      starBtn(favSessions.value.has(s.id), () => toggleFavSession(s.id)),
+      h('div', { class: 'ccm-session-card-meta' }, [
+        srcBadge(s.source),
+        h('span', { class: 'ccm-session-card-count' }, `${s.messageCount} messages`),
+        h('span', { class: 'ccm-tag' }, s.project.split('/').pop() || s.project),
+        s.gitBranch ? h('span', { class: 'ccm-tag' }, s.gitBranch) : null,
+      ].filter(Boolean)),
+      h('span', { style: 'position:absolute;right:10px;top:50%;transform:translateY(-50%);display:flex;align-items:center' },
+        starBtn(favSessions.value.has(s.id), () => toggleFavSession(s.id))),
     ])
   }
 
