@@ -14,9 +14,15 @@ export async function listSessions(exec: ExecFn, encodedPath: string): Promise<S
   return JSON.parse(res.stdout)
 }
 
-export async function readSession(exec: ExecFn, encodedPath: string, sessionId: string): Promise<Message[]> {
-  const res = await exec(['read-session', encodedPath, sessionId])
+export async function readSession(exec: ExecFn, encodedPath: string, sessionId: string, source?: string): Promise<Message[]> {
+  const res = await exec(['read-session', encodedPath, sessionId, source || 'claude-code'])
   if (res.code !== 0) throw new Error(res.stderr || 'read-session failed')
+  return JSON.parse(res.stdout)
+}
+
+export async function projectSessions(exec: ExecFn, projectPath: string): Promise<Session[]> {
+  const res = await exec(['project-sessions', projectPath])
+  if (res.code !== 0) throw new Error(res.stderr || 'project-sessions failed')
   return JSON.parse(res.stdout)
 }
 

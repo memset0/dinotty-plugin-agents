@@ -1,14 +1,15 @@
 import type { Project, Session, SearchResult, AgentSource } from '../types'
 import { type AgentProvider } from './base'
 import { ClaudeProvider } from './claude'
+import { CodexProvider } from './codex'
 
 export * from './base'
 
 let _providers: AgentProvider[] | null = null
 
-/** Registry of agent backends. Add new agents (Codex, opencode) here. */
+/** Registry of agent backends. Add new agents (opencode, …) here. */
 export function getProviders(): AgentProvider[] {
-  if (!_providers) _providers = [new ClaudeProvider() /* , new CodexProvider() — Phase 1 next */]
+  if (!_providers) _providers = [new ClaudeProvider(), new CodexProvider()]
   return _providers
 }
 
@@ -53,4 +54,12 @@ export function aggregateSearch(query: string, limit: number): SearchResult[] {
     try { out.push(...p.search(query, limit - out.length)) } catch { /* skip */ }
   }
   return out.slice(0, limit)
+}
+
+/** Sessions for one project (cwd), merged across agents — newest first. */
+export function aggregateProjectSessions(projectPath: string): Session[] {
+  const all = getProviders().filter(p => p.available()).flatMap(p => {
+    try { return p.listSessionsByProject(projectPath) } catch { return [] }
+  })
+  return all.sort((a, b) => ts(b.lastTimestamp) - ts(a.lastTimestamp))
 }

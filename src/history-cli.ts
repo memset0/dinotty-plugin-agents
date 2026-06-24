@@ -1,7 +1,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
-import { getProvider, aggregateRecent, aggregateProjects, aggregateSearch } from './providers'
+import { getProvider, aggregateRecent, aggregateProjects, aggregateProjectSessions, aggregateSearch } from './providers'
 import { ClaudeProvider } from './providers/claude'
 
 function out(v: any) { console.log(JSON.stringify(v)) }
@@ -42,6 +42,10 @@ switch (subcommand) {
     out(p ? p.readSession(args[0], args[1]) : [])
     break
   }
+  case 'project-sessions':
+    if (!args[0]) { console.error('Usage: project-sessions <projectPath>'); process.exit(1) }
+    out(aggregateProjectSessions(args[0]))
+    break
   case 'search':
     if (!args[0]) { console.error('Usage: search <query>'); process.exit(1) }
     out(aggregateSearch(args.join(' '), 20))

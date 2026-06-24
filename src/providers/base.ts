@@ -31,6 +31,8 @@ export interface AgentProvider {
   available(): boolean
   listProjects(): Project[]
   listSessions(encodedPath: string): Session[]
+  /** Sessions for a given project (absolute cwd) — lets the UI group both agents under one project. */
+  listSessionsByProject(projectPath: string): Session[]
   readSession(encodedPath: string, id: string): Message[]
   search(query: string, limit: number): SearchResult[]
   listRecent(limit: number): Session[]

@@ -1,7 +1,7 @@
 import type { PluginContext, PluginExports } from '../../plugin-api/index'
 import type { Session, Message, Project, SearchResult, FileChange } from './types'
 import { aggregateFileChanges, computeEditDiff, type DiffLine } from './diff'
-import { listProjects, listSessions, readSession, searchSessions, listRecentSessions, listSkills, listDirs } from './history'
+import { listProjects, listSessions, projectSessions, readSession, searchSessions, listRecentSessions, listSkills, listDirs } from './history'
 import { createConversation, continueConversation } from './claude'
 import {
   initIcons,
@@ -183,6 +183,19 @@ export function activate(ctx: PluginContext): PluginExports {
     return ctx.exec.run(args, options)
   }
 
+  // Source badge: distinguishes Claude Code vs Codex sessions.
+  function srcBadge(source?: string) {
+    if (!source) return null
+    const codex = source === 'codex'
+    return h('span', {
+      class: 'ccm-tag',
+      title: source,
+      style: codex
+        ? 'background:rgba(96,165,250,0.16);color:#60a5fa;font-weight:600'
+        : 'background:rgba(217,119,87,0.16);color:#d97757;font-weight:600',
+    }, codex ? 'Codex' : 'Claude')
+  }
+
   function encodePath(projectPath: string): string {
     // Same encoding Claude Code uses: /Users/talentc/rust/dinotty-plugins → -Users-talentc-rust-dinotty-plugins
     return projectPath.replace(/^\//, '').replace(/\//g, '-')
@@ -273,7 +286,7 @@ export function activate(ctx: PluginContext): PluginExports {
     loading.value = true
     error.value = null
     try {
-      sessions.value = await listSessions(exec, project.encodedPath)
+      sessions.value = await projectSessions(exec, project.path)
     } catch (e: any) {
       error.value = e.message
     } finally {
@@ -294,7 +307,7 @@ export function activate(ctx: PluginContext): PluginExports {
       currentCwd.value = session.project
     }
     try {
-      messages.value = await readSession(exec, session.encodedPath, session.id)
+      messages.value = await readSession(exec, session.encodedPath, session.id, session.source)
       scrollToBottom()
     } catch (e: any) {
       error.value = e.message
@@ -392,6 +405,7 @@ export function activate(ctx: PluginContext): PluginExports {
         }]
       }
       scrollToBottom()
+      if (!stopRequested.value) await reconcileActiveSession()
     } catch (e: any) {
       if (!stopRequested.value) {
         error.value = e.message
@@ -408,6 +422,25 @@ export function activate(ctx: PluginContext): PluginExports {
       const el = chatScrollRef.value
       if (el) el.scrollTop = el.scrollHeight
     }, 50)
+  }
+
+  // After a send completes, re-read the on-disk transcript so tool steps appear,
+  // preserving the user's scroll position (only auto-stick if already at bottom).
+  async function reconcileActiveSession() {
+    const s = activeSession.value
+    if (!s) return
+    const el = chatScrollRef.value
+    const atBottom = el ? (el.scrollHeight - el.scrollTop - el.clientHeight < 48) : true
+    const prevTop = el ? el.scrollTop : 0
+    try {
+      const msgs = await readSession(exec, s.encodedPath, s.id, s.source)
+      if (msgs && msgs.length) messages.value = msgs
+    } catch { /* keep optimistic view */ }
+    setTimeout(() => {
+      const e2 = chatScrollRef.value
+      if (!e2) return
+      e2.scrollTop = atBottom ? e2.scrollHeight : prevTop
+    }, 30)
   }
 
   function toggleTool(msgId: string, toolIdx: number) {
@@ -530,6 +563,7 @@ export function activate(ctx: PluginContext): PluginExports {
           h('span', { class: 'ccm-project-chevron' }, selectedProject.value === p.path ? IconChevronDown(12) : IconChevronRight(12)),
           h('span', { class: 'ccm-project-icon' }, IconFolder(14)),
           h('span', { class: 'ccm-project-label' }, p.path.split('/').pop() || p.path),
+          ...((p.sources || []).map(srcBadge)),
           h('span', { class: 'ccm-project-count' }, String(p.sessionCount)),
         ]),
         selectedProject.value === p.path ? h('div', { class: 'ccm-session-list' },
@@ -537,8 +571,9 @@ export function activate(ctx: PluginContext): PluginExports {
             class: `ccm-session-row ${activeSession.value?.id === s.id ? 'ccm-session-row-active' : ''}`,
             onClick: () => openSession(s),
           }, [
-            h('div', { class: 'ccm-session-text' }, s.firstPrompt.slice(0, 50) || '(empty)'),
+            h('div', { class: 'ccm-session-text' }, (s.name || s.firstPrompt || '').slice(0, 50) || '(empty)'),
             h('div', { class: 'ccm-session-info' }, [
+              srcBadge(s.source),
               h('span', null, formatTime(s.lastTimestamp)),
               s.gitBranch ? h('span', { class: 'ccm-tag' }, s.gitBranch) : null,
             ].filter(Boolean)),
@@ -570,6 +605,7 @@ export function activate(ctx: PluginContext): PluginExports {
         h('div', { class: 'ccm-session-text' }, r.session.firstPrompt.slice(0, 50)),
         h('div', { class: 'ccm-search-snippet' }, r.match.slice(0, 80)),
         h('div', { class: 'ccm-session-info' }, [
+          srcBadge(r.session.source),
           h('span', { class: 'ccm-tag' }, r.session.project.split('/').pop()),
           h('span', null, formatTime(r.session.lastTimestamp)),
         ]),
@@ -1196,10 +1232,11 @@ export function activate(ctx: PluginContext): PluginExports {
       onClick: () => openSession(s),
     }, [
       h('div', { class: 'ccm-session-card-header' }, [
-        h('span', { class: 'ccm-session-card-title' }, s.firstPrompt.slice(0, 80) || '(empty)'),
+        h('span', { class: 'ccm-session-card-title' }, (s.name || s.firstPrompt || '').slice(0, 80) || '(empty)'),
         h('span', { class: 'ccm-session-card-time' }, formatTime(s.lastTimestamp)),
       ]),
       h('div', { class: 'ccm-session-card-meta' }, [
+        srcBadge(s.source),
         h('span', { class: 'ccm-session-card-count' }, `${s.messageCount} messages`),
         h('span', { class: 'ccm-tag' }, s.project.split('/').pop() || s.project),
         s.gitBranch ? h('span', { class: 'ccm-tag' }, s.gitBranch) : null,

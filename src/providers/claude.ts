@@ -16,6 +16,10 @@ function fallbackDecode(encodedPath: string): string {
   return '/' + encodedPath.replace(/^-/, '').replace(/-/g, '/')
 }
 
+function encodeClaude(p: string): string {
+  return p.replace(/^\//, '').replace(/\//g, '-')
+}
+
 function summarizeTool(name: string, input: any): string {
   if (!input) return name
   switch (name) {
@@ -148,6 +152,10 @@ export class ClaudeProvider implements AgentProvider {
       if (meta) sessions.push(meta)
     }
     return sessions
+  }
+
+  listSessionsByProject(projectPath: string): Session[] {
+    return this.listSessions(encodeClaude(projectPath))
   }
 
   readSession(encodedPath: string, sessionId: string): Message[] {
