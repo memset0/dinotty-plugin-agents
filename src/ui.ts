@@ -1,8 +1,8 @@
 import type { PluginContext, PluginExports } from '../../plugin-api/index'
-import type { Session, Message, Project, SearchResult, FileChange, ToolUse } from './types'
+import type { Session, Message, Project, SearchResult, FileChange, ToolUse, AgentSource } from './types'
 import { aggregateFileChanges, computeEditDiff, type DiffLine } from './diff'
-import { listProjects, listSessions, projectSessions, readSession, searchSessions, listRecentSessions, listSkills, listDirs, getConfig } from './history'
-import { createConversation, continueConversation } from './claude'
+import { listProjects, listSessions, projectSessions, readSession, searchSessions, listRecentSessions, listSkills, listDirs, getConfig, listModels, type ModelInfo } from './history'
+import { sendAgent } from './claude'
 import {
   initIcons,
   IconSearch, IconRefresh, IconPlus, IconX, IconChevronRight, IconChevronDown,
@@ -55,9 +55,17 @@ export function activate(ctx: PluginContext): PluginExports {
   const pickerEntries = ctx.ref<{ name: string; path: string }[]>([])
   const pickerLoading = ctx.ref(false)
   const showSettings = ctx.ref(false)
-  const settings = ctx.ref<{ claudeConfigDir: string; codexHome: string; claudeBin: string }>({ claudeConfigDir: '', codexHome: '', claudeBin: '' })
+  const settings = ctx.ref<{ claudeConfigDir: string; codexHome: string; claudeBin: string; codexBin: string }>({ claudeConfigDir: '', codexHome: '', claudeBin: '', codexBin: '' })
   const favProjects = ctx.ref<Set<string>>(new Set())
   const favSessions = ctx.ref<Set<string>>(new Set())
+  // Agent for a *new* chat (existing sessions use their own source). Streaming handle for real Stop.
+  const newChatSource = ctx.ref<AgentSource>('claude-code')
+  let activeStreamCancel: (() => void) | null = null
+  // Model/effort for the next send: initialized from the session (inherit), editable (modify).
+  const activeModel = ctx.ref<string>('')      // concrete model slug (codex)
+  const activeEffort = ctx.ref<string>('')     // concrete effort: low|medium|high|xhigh (codex)
+  const activePermission = ctx.ref<string>('') // read-only|workspace-write|danger-full-access (codex)
+  const codexModels = ctx.ref<ModelInfo[]>([])
 
   // --- Computed ---
   const fileChanges = ctx.computed(() => aggregateFileChanges(messages.value))
@@ -188,23 +196,46 @@ export function activate(ctx: PluginContext): PluginExports {
     if (s.claudeConfigDir && s.claudeConfigDir.trim()) env.CLAUDE_CONFIG_DIR = s.claudeConfigDir.trim()
     if (s.codexHome && s.codexHome.trim()) env.CODEX_HOME = s.codexHome.trim()
     if (s.claudeBin && s.claudeBin.trim()) env.CLAUDE_BIN = s.claudeBin.trim()
+    if (s.codexBin && s.codexBin.trim()) env.CODEX_BIN = s.codexBin.trim()
     return env
   }
   function exec(args: string[], options?: { timeout?: number; cwd?: string; env?: Record<string, string> }) {
     return ctx.exec.run(args, { ...options, env: { ...settingsEnv(), ...(options?.env || {}) } })
+  }
+  function spawnExec(args: string[], options?: { cwd?: string; env?: Record<string, string> }) {
+    const env = { ...settingsEnv(), ...(options?.env || {}) }
+    // dinotty's spawn WS drops cwd/env (unlike run), so smuggle them in via args — the
+    // CLI applies `--with-env` before dispatch. (Still pass options for when the host is fixed.)
+    const cfg = JSON.stringify({ cwd: options?.cwd || '', env })
+    return ctx.exec.spawn(['--with-env', cfg, ...args], { ...options, env })
   }
   async function loadSettings() {
     let saved: any = {}
     try { saved = (await ctx.storage.get<any>('settings')) || {} } catch { /* */ }
     // Prefill empty fields with the actually-resolved defaults (so the panel
     // shows what's being used, not blanks).
-    let def = { claudeConfigDir: '', codexHome: '', claudeBin: '' }
+    let def = { claudeConfigDir: '', codexHome: '', claudeBin: '', codexBin: '' }
     try { def = await getConfig(exec) } catch { /* */ }
     settings.value = {
       claudeConfigDir: saved.claudeConfigDir || def.claudeConfigDir || '',
       codexHome: saved.codexHome || def.codexHome || '',
       claudeBin: saved.claudeBin || def.claudeBin || '',
+      codexBin: saved.codexBin || def.codexBin || '',
     }
+  }
+  async function loadModels() {
+    try { codexModels.value = await listModels(exec, 'codex') } catch { /* */ }
+  }
+  // Resolve concrete codex defaults so selectors never show a bare "default".
+  function defaultCodexModel(): string { return codexModels.value[0]?.slug || 'gpt-5.5' }
+  function codexDefaultEffort(model: string): string { return codexModels.value.find(m => m.slug === model)?.defaultEffort || 'medium' }
+  // Set the codex selectors from a session (inherit) or to sensible defaults (new chat).
+  async function applyCodexControls(session: Session | null) {
+    if (!codexModels.value.length) { try { await loadModels() } catch { /* */ } }
+    const model = (session?.model) || defaultCodexModel()
+    activeModel.value = model
+    activeEffort.value = (session?.effort) || codexDefaultEffort(model)
+    activePermission.value = (session?.permission) || 'workspace-write'
   }
   async function refreshLists() {
     loadRecentSessions()
@@ -264,6 +295,53 @@ export function activate(ctx: PluginContext): PluginExports {
         ? 'background:rgba(96,165,250,0.16);color:#60a5fa;font-weight:600'
         : 'background:rgba(217,119,87,0.16);color:#d97757;font-weight:600',
     }, codex ? 'Codex' : 'Claude')
+  }
+
+  // Agent selector for a new chat (Claude / Codex).
+  function agentChip(src: AgentSource, label: string) {
+    const active = newChatSource.value === src
+    const on = src === 'codex' ? 'background:rgba(96,165,250,0.18);color:#60a5fa' : 'background:rgba(217,119,87,0.18);color:#d97757'
+    return h('span', {
+      onClick: (e: Event) => { e.stopPropagation(); newChatSource.value = src; if (src === 'codex' && !activeSession.value) applyCodexControls(null) },
+      title: `New chat with ${label}`,
+      style: `cursor:pointer;font-size:11px;font-weight:600;padding:1px 7px;border-radius:10px;${active ? on : 'opacity:.45'}`,
+    }, label)
+  }
+
+  // Model + effort + permission selectors (Codex). Selection is pre-filled from the session
+  // (inherit) and concrete — never a bare "default".
+  function renderModelEffort() {
+    const effSource: AgentSource = activeSession.value?.source || newChatSource.value
+    if (effSource !== 'codex') return null
+    const sel = (value: string, onChange: (v: string) => void, opts: { v: string; label: string }[], title: string) =>
+      h('select', {
+        title, value,
+        style: 'font-size:11px;background:transparent;border:1px solid var(--border-color,rgba(255,255,255,.14));border-radius:8px;padding:1px 4px;color:inherit;cursor:pointer;max-width:150px',
+        onChange: (e: Event) => onChange((e.target as HTMLSelectElement).value),
+      }, opts.map(o => h('option', { value: o.v }, o.label)))
+    // Model — concrete current value, always present in the option list.
+    const curModel = activeModel.value || defaultCodexModel()
+    const modelOpts = codexModels.value.map(m => ({ v: m.slug, label: m.name || m.slug }))
+    if (!modelOpts.some(o => o.v === curModel)) modelOpts.unshift({ v: curModel, label: curModel })
+    // Effort — restricted to the model's supported levels.
+    const cur = codexModels.value.find(m => m.slug === curModel)
+    const effortList = (cur?.efforts && cur.efforts.length) ? cur.efforts : ['low', 'medium', 'high', 'xhigh']
+    const curEffort = activeEffort.value || codexDefaultEffort(curModel)
+    const effortOpts = effortList.map(e => ({ v: e, label: `effort: ${e}` }))
+    if (!effortOpts.some(o => o.v === curEffort)) effortOpts.unshift({ v: curEffort, label: `effort: ${curEffort}` })
+    // Permission / sandbox (YOLO = full access).
+    const curPerm = activePermission.value || 'workspace-write'
+    const permOpts = [
+      { v: 'read-only', label: 'read-only' },
+      { v: 'workspace-write', label: 'workspace-write' },
+      { v: 'danger-full-access', label: 'full-access (YOLO)' },
+    ]
+    if (!permOpts.some(o => o.v === curPerm)) permOpts.unshift({ v: curPerm, label: curPerm })
+    return h('span', { style: 'display:inline-flex;gap:4px;align-items:center' }, [
+      sel(curModel, (v) => { activeModel.value = v; const m = codexModels.value.find(x => x.slug === v); if (m && m.efforts.length && !m.efforts.includes(activeEffort.value)) activeEffort.value = m.defaultEffort || 'medium' }, modelOpts, 'Model'),
+      sel(curEffort, (v) => { activeEffort.value = v }, effortOpts, 'Reasoning effort'),
+      sel(curPerm, (v) => { activePermission.value = v }, permOpts, 'Permission / sandbox (YOLO = full access)'),
+    ])
   }
 
   function encodePath(projectPath: string): string {
@@ -371,6 +449,8 @@ export function activate(ctx: PluginContext): PluginExports {
     error.value = null
     messages.value = []
     expandedTools.value = new Set()
+    // Inherit the session's model/effort/permission as the default for the next send (editable).
+    if (session.source === 'codex') applyCodexControls(session)
     // Set working directory from session project
     if (session.project && session.project !== '.') {
       currentCwd.value = session.project
@@ -392,6 +472,7 @@ export function activate(ctx: PluginContext): PluginExports {
     costTotal.value = 0
     error.value = null
     expandedTools.value = new Set()
+    if (newChatSource.value === 'codex') applyCodexControls(null)  // concrete codex defaults
     view.value = 'chat'
     sidebarOpen.value = false
     // Load saved CWD from storage
@@ -419,70 +500,140 @@ export function activate(ctx: PluginContext): PluginExports {
 
   function stopSending() {
     stopRequested.value = true
+    if (activeStreamCancel) { try { activeStreamCancel() } catch { /* */ } }
+    activeStreamCancel = null
     sending.value = false
+  }
+
+  // Register a session row for a freshly-minted new chat so reconcile can read it back.
+  function setActiveFromNew(sessionId: string, source: AgentSource, cwd?: string) {
+    const projectPath = selectedProject.value || cwd || currentCwd.value || '.'
+    activeSession.value = {
+      id: sessionId, project: projectPath, encodedPath: encodePath(projectPath),
+      firstPrompt: (messages.value.find(m => m.role === 'user')?.content || '').slice(0, 200),
+      lastTimestamp: new Date().toISOString(), messageCount: 1, source,
+    }
+    if (projectPath && projectPath !== '.') currentCwd.value = projectPath
+  }
+
+  // Keep the view pinned to the newest content during a stream (only if already near bottom).
+  function streamScroll() {
+    setTimeout(() => {
+      const el = chatScrollRef.value
+      if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 120) el.scrollTop = el.scrollHeight
+    }, 0)
+  }
+
+  /**
+   * Try a streamed turn over `agent-stream`. Returns false (so the caller falls back to a
+   * blocking send) when streaming is unsupported or yields nothing. Mutates `asst` in place.
+   */
+  async function trySendStreaming(
+    opts: { source: AgentSource; mode: 'new' | 'resume'; sessionId: string; prompt: string; cwd?: string; model?: string; effort?: string; permission?: string },
+    asst: Message, ensureAsst: () => void, touch: () => void,
+  ): Promise<boolean> {
+    let handle: ReturnType<typeof spawnExec>
+    try {
+      handle = spawnExec(['agent-stream', opts.source, opts.mode === 'new' ? '--new' : '--resume', opts.sessionId || '', opts.model || '', opts.effort || '', opts.permission || '', opts.prompt], { cwd: opts.cwd })
+    } catch { return false }
+    if (!handle || !handle.stdout) return false
+    activeStreamCancel = () => { try { handle.kill() } catch { /* */ } }
+
+    const upsertTool = (tool: ToolUse) => {
+      ensureAsst()
+      const tools = asst.toolUses || (asst.toolUses = [])
+      const idx = tool.callId ? tools.findIndex(t => t.callId === tool.callId) : -1
+      if (idx >= 0) tools[idx] = { ...tools[idx], ...tool }
+      else tools.push(tool)
+    }
+    let gotAnything = false, unsupported = false, newSessionId = ''
+    const handleEvent = (o: any) => {
+      if (!o || !o.type) return
+      switch (o.type) {
+        case 'unsupported': unsupported = true; break
+        case 'session': newSessionId = o.sessionId || newSessionId; break
+        case 'delta': gotAnything = true; ensureAsst(); asst.content += (o.text || ''); touch(); streamScroll(); break
+        case 'tool': gotAnything = true; upsertTool(o.tool); touch(); streamScroll(); break
+        case 'error': if (gotAnything) error.value = o.message; break
+        case 'done': newSessionId = o.sessionId || newSessionId; costTotal.value += (o.costUsd || 0); break
+      }
+    }
+
+    const reader = handle.stdout.getReader()
+    let buf = ''
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += value
+        let nl: number
+        while ((nl = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1)
+          if (!line) continue
+          try { handleEvent(JSON.parse(line)) } catch { /* partial/non-json */ }
+        }
+      }
+    } catch { /* reader aborted (e.g. Stop) */ }
+
+    activeStreamCancel = null
+    if (unsupported) return false
+    if (!gotAnything && !newSessionId && !stopRequested.value) return false // produced nothing → fall back
+    if (opts.mode === 'new' && newSessionId) setActiveFromNew(newSessionId, opts.source, opts.cwd)
+    return true
   }
 
   async function sendMessage() {
     const text = inputText.value.trim()
     if (!text || sending.value) return
 
+    const source: AgentSource = activeSession.value?.source || newChatSource.value
+    const mode: 'new' | 'resume' = activeSession.value ? 'resume' : 'new'
+    const existingId = activeSession.value?.id || ''
+    const model = activeModel.value || undefined  // initialized from the session = inherit; user-changed = modify
+    const effort = activeEffort.value || undefined
+    const permission = source === 'codex' ? (activePermission.value || undefined) : undefined
+
     sending.value = true
     stopRequested.value = false
     error.value = null
 
-    const userMsg: Message = {
-      uuid: 'pending-' + Date.now(),
-      role: 'user',
-      content: text,
-      timestamp: new Date().toISOString(),
-    }
+    const userMsg: Message = { uuid: 'pending-' + Date.now(), role: 'user', content: text, timestamp: new Date().toISOString(), source }
     messages.value = [...messages.value, userMsg]
     inputText.value = ''
     scrollToBottom()
 
+    // Optimistic assistant bubble, mutated as the stream arrives (appended lazily on first output).
+    const asstId = 'resp-' + Date.now()
+    const asst: Message = { uuid: asstId, role: 'assistant', content: '', timestamp: new Date().toISOString(), source, toolUses: [] }
+    let asstAppended = false
+    const ensureAsst = () => { if (!asstAppended) { messages.value = [...messages.value, asst]; asstAppended = true } }
+    const touch = () => { messages.value = [...messages.value] }
+
     try {
       const cwd = currentCwd.value || await getActiveCwd()
       if (stopRequested.value) return
-      if (activeSession.value) {
-        const result = await continueConversation(exec, activeSession.value.id, text, { cwd })
+
+      const streamed = await trySendStreaming({ source, mode, sessionId: existingId, prompt: text, cwd, model, effort, permission }, asst, ensureAsst, touch)
+      if (!streamed && !stopRequested.value) {
+        // Blocking fallback (streaming unsupported or empty).
+        const r = await sendAgent(exec, source, mode, existingId, text, { cwd, model, effort, permission })
         if (stopRequested.value) return
-        costTotal.value += result.costUsd
-        messages.value = [...messages.value, {
-          uuid: 'resp-' + Date.now(),
-          role: 'assistant',
-          content: result.response,
-          timestamp: new Date().toISOString(),
-        }]
-      } else {
-        const result = await createConversation(exec, text, { cwd })
-        if (stopRequested.value) return
-        costTotal.value += result.costUsd
-        const projectPath = selectedProject.value || cwd || currentCwd.value || '.'
-        activeSession.value = {
-          id: result.sessionId,
-          project: projectPath,
-          encodedPath: encodePath(projectPath),
-          firstPrompt: text,
-          lastTimestamp: new Date().toISOString(),
-          messageCount: 1,
-        }
-        messages.value = [...messages.value, {
-          uuid: 'resp-' + Date.now(),
-          role: 'assistant',
-          content: result.response,
-          timestamp: new Date().toISOString(),
-        }]
+        costTotal.value += r.costUsd
+        if (mode === 'new' && r.sessionId) setActiveFromNew(r.sessionId, source, cwd)
+        asst.content = r.response
+        ensureAsst(); touch()
       }
       scrollToBottom()
       if (!stopRequested.value) await reconcileActiveSession()
     } catch (e: any) {
       if (!stopRequested.value) {
         error.value = e.message
-        messages.value = messages.value.filter(m => !m.uuid.startsWith('pending-'))
+        messages.value = messages.value.filter(m => !m.uuid.startsWith('pending-') && m.uuid !== asstId)
       }
     } finally {
       sending.value = false
       stopRequested.value = false
+      activeStreamCancel = null
     }
   }
 
@@ -866,6 +1017,12 @@ export function activate(ctx: PluginContext): PluginExports {
           IconFolder(12),
           h('span', null, currentCwd.value ? (currentCwd.value.split('/').pop() || currentCwd.value) : 'Set project'),
         ]),
+        // New chat: choose the agent. Existing session: show which agent it is.
+        activeSession.value
+          ? (activeSession.value.source ? srcBadge(activeSession.value.source) : null)
+          : h('span', { style: 'display:inline-flex;gap:2px;align-items:center' }, [agentChip('claude-code', 'Claude'), agentChip('codex', 'Codex')]),
+        // Model + effort (Codex): default = inherited from the session, editable.
+        renderModelEffort(),
         h('span', null, 'Shift+Enter for new line  |  / for commands'),
       ]),
     ])
@@ -1208,7 +1365,7 @@ export function activate(ctx: PluginContext): PluginExports {
         ctx.onMounted(() => {
           console.log('[agents-view] onMounted called')
           loadFavorites()
-          loadSettings().then(() => { loadRecentSessions(); loadProjects() })
+          loadSettings().then(() => { loadRecentSessions(); loadProjects(); loadModels() })
           // Pre-load skills for slash command palette
           listSkills(exec).then(s => { skillsList.value = s }).catch(() => {})
           document.addEventListener('keydown', handleGlobalKeydown)
@@ -1237,7 +1394,7 @@ export function activate(ctx: PluginContext): PluginExports {
   }
 
   function renderSettings() {
-    const field = (label: string, key: 'claudeConfigDir' | 'codexHome' | 'claudeBin', placeholder: string) =>
+    const field = (label: string, key: 'claudeConfigDir' | 'codexHome' | 'claudeBin' | 'codexBin', placeholder: string) =>
       h('div', { style: 'margin-bottom:12px' }, [
         h('label', { style: 'display:block;font-size:12px;opacity:.7;margin-bottom:4px' }, label),
         h('input', {
@@ -1264,6 +1421,7 @@ export function activate(ctx: PluginContext): PluginExports {
           ]),
           section('Codex', [
             field('Home (CODEX_HOME)', 'codexHome', '~/.codex'),
+            field('Binary (CODEX_BIN)', 'codexBin', 'auto-detect if empty'),
           ]),
           h('div', { style: 'font-size:11px;opacity:.55;line-height:1.5' },
             'Prefilled with the values currently in use. Reading another user’s dir (e.g. /root/.claude) requires the dinotty process to have read access — run dinotty as that user, or grant an ACL.'),

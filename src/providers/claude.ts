@@ -1,9 +1,10 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
-import { execFile, execFileSync } from 'child_process'
+import { execFile, execFileSync, spawn } from 'child_process'
+import { randomUUID } from 'crypto'
 import type { Project, Session, Message, SearchResult, ToolUse, AgentSource } from '../types'
-import { resolveAgentDir, type AgentProvider } from './base'
+import { resolveAgentDir, type AgentProvider, type SendOpts, type SendResult, type StreamCallbacks, type StreamHandle } from './base'
 
 const SOURCE: AgentSource = 'claude-code'
 
@@ -272,22 +273,77 @@ export class ClaudeProvider implements AgentProvider {
     return 'claude'
   }
 
-  /** Headless send (--new | --resume). Prints {sessionId, response, costUsd} JSON. */
+  /** Build the claude argv shared by the blocking and streaming paths. */
+  private buildArgs(opts: SendOpts, outputFormat: 'json' | 'stream-json'): { args: string[]; sessionId: string } {
+    const sessionId = opts.mode === 'new' ? (opts.sessionId || randomUUID()) : (opts.sessionId || '')
+    const args = ['-p', opts.prompt, '--output-format', outputFormat, '--permission-mode', 'acceptEdits']
+    if (outputFormat === 'stream-json') args.push('--verbose') // stream-json with -p requires --verbose
+    if (opts.mode === 'new') { args.push('--session-id', sessionId, '--model', opts.model || 'sonnet') }
+    else { args.push('--resume', opts.sessionId!); if (opts.model) args.push('--model', opts.model) }
+    return { args, sessionId }
+  }
+
+  /** Headless blocking send (--output-format json). */
+  send(opts: SendOpts): Promise<SendResult> {
+    const { args, sessionId } = this.buildArgs(opts, 'json')
+    return new Promise((resolve, reject) => {
+      execFile(this.findBin(), args, { cwd: opts.cwd, timeout: 600_000, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err && !stdout) { reject(new Error(stderr || err.message)); return }
+        try {
+          const data = JSON.parse(stdout)
+          resolve({ sessionId: data.session_id || sessionId, response: data.result || '', costUsd: data.total_cost_usd || data.cost_usd || 0 })
+        } catch {
+          resolve({ sessionId, response: stdout.trim(), costUsd: 0 })
+        }
+      })
+    })
+  }
+
+  /** Streaming send via `--output-format stream-json`; maps claude events onto the common callbacks. */
+  sendStreaming(opts: SendOpts, cbs: StreamCallbacks): StreamHandle | null {
+    const { args, sessionId } = this.buildArgs(opts, 'stream-json')
+    const child = spawn(this.findBin(), args, { cwd: opts.cwd, stdio: ['ignore', 'pipe', 'pipe'], env: process.env })
+    let sid = sessionId, costUsd = 0, buf = '', stderr = ''
+    if (sid) cbs.onSession(sid)
+    child.stdout.setEncoding('utf-8')
+    child.stdout.on('data', (chunk: string) => {
+      buf += chunk
+      let nl: number
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1)
+        if (!line) continue
+        let o: any; try { o = JSON.parse(line) } catch { continue }
+        if (o.type === 'system' && o.session_id) { sid = o.session_id; cbs.onSession(sid) }
+        else if (o.type === 'assistant' && o.message?.content) {
+          for (const block of o.message.content) {
+            if (block.type === 'text' && block.text) cbs.onDelta(block.text)
+            else if (block.type === 'tool_use') {
+              const tu: ToolUse = { name: block.name, summary: summarizeTool(block.name, block.input), callId: block.id }
+              if (block.name === 'Edit' && block.input) { tu.filePath = block.input.file_path || ''; tu.oldString = block.input.old_string || ''; tu.newString = block.input.new_string || ''; tu.replaceAll = block.input.replace_all || false }
+              else if (block.name === 'Write' && block.input) { tu.filePath = block.input.file_path || ''; tu.content = block.input.content || '' }
+              cbs.onToolUse(tu)
+            }
+          }
+        }
+        else if (o.type === 'result') { if (o.session_id) sid = o.session_id; costUsd = o.total_cost_usd || o.cost_usd || costUsd }
+      }
+    })
+    child.stderr.setEncoding('utf-8')
+    child.stderr.on('data', (d: string) => { stderr += d })
+    const done = new Promise<void>((resolve) => {
+      child.on('error', (e) => { cbs.onError(e.message); resolve() })
+      child.on('close', (code) => { if (code && code !== 0 && stderr) cbs.onError(stderr.trim().slice(0, 500)); cbs.onDone({ sessionId: sid, costUsd }); resolve() })
+    })
+    return { wait: () => done, kill: () => { try { child.kill('SIGKILL') } catch { /* */ } } }
+  }
+
+  /** Legacy `claude-call --new|--resume <id> <prompt>` CLI alias (delegates to send). */
   call(args: string[]): void {
     const flag = args[0], sessionId = args[1], prompt = args.slice(2).join(' ')
     if (!flag || !sessionId || !prompt) { console.error('Usage: claude-call --new|--resume <session-id> <prompt>'); process.exit(1) }
-    const claudeArgs = ['-p', prompt, '--output-format', 'json', '--permission-mode', 'acceptEdits']
-    if (flag === '--new') claudeArgs.push('--session-id', sessionId, '--model', 'sonnet')
-    else claudeArgs.push('--resume', sessionId)
-    execFile(this.findBin(), claudeArgs, { timeout: 300_000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) { console.error(stderr || err.message); process.exit(1); return }
-      try {
-        const data = JSON.parse(stdout)
-        console.log(JSON.stringify({ sessionId: data.session_id || sessionId, response: data.result || '', costUsd: data.cost_usd || 0 }))
-      } catch {
-        console.log(JSON.stringify({ sessionId, response: stdout.trim(), costUsd: 0 }))
-      }
-    })
+    this.send({ mode: flag === '--new' ? 'new' : 'resume', sessionId, prompt, cwd: process.cwd() })
+      .then(r => console.log(JSON.stringify(r)))
+      .catch(e => { console.error(e.message); process.exit(1) })
   }
 }
 

@@ -11,6 +11,12 @@ export interface Session {
   source: AgentSource
   /** Optional human name (Codex thread_name; Claude derives from firstPrompt). */
   name?: string
+  /** Last model used in the session (read from the rollout) — the default to inherit on send. */
+  model?: string
+  /** Last reasoning effort (Codex: low|medium|high|xhigh; null/absent = model default). */
+  effort?: string
+  /** Last permission/sandbox (Codex: read-only|workspace-write|danger-full-access) — inherit on send. */
+  permission?: string
 }
 
 export interface Message {

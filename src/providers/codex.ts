@@ -1,9 +1,29 @@
 import * as fs from 'fs'
 import * as path from 'path'
+import * as os from 'os'
+import { spawn, execFileSync } from 'child_process'
 import type { Project, Session, Message, SearchResult, ToolUse, AgentSource } from '../types'
-import { resolveAgentDir, type AgentProvider } from './base'
+import { resolveAgentDir, type AgentProvider, type SendOpts, type SendResult, type StreamCallbacks, type StreamHandle } from './base'
 
 const SOURCE: AgentSource = 'codex'
+
+/** Map a codex `--json` stream item to a ToolUse (upserted by callId on the UI side). */
+function codexItemToTool(it: any): ToolUse | null {
+  if (!it || !it.type) return null
+  switch (it.type) {
+    case 'command_execution':
+      return { name: 'Bash', summary: String(it.command || 'command').slice(0, 100), args: String(it.command || ''), output: it.aggregated_output ? String(it.aggregated_output).slice(0, 4000) : undefined, callId: it.id }
+    case 'file_change':
+    case 'patch':
+      return { name: 'Edit', summary: String(it.path || it.summary || 'patch').slice(0, 100), callId: it.id, output: it.diff ? String(it.diff).slice(0, 4000) : undefined }
+    case 'mcp_tool_call':
+      return { name: it.server ? `mcp:${it.server}` : 'mcp', summary: String(it.tool || it.name || 'mcp').slice(0, 100), args: it.arguments ? JSON.stringify(it.arguments) : undefined, output: it.result ? String(it.result).slice(0, 4000) : undefined, callId: it.id }
+    case 'web_search':
+      return { name: 'WebSearch', summary: String(it.query || 'search').slice(0, 100), callId: it.id }
+    default:
+      return null
+  }
+}
 
 function readLines(f: string): string[] {
   try { return fs.readFileSync(f, 'utf-8').split('\n').filter(l => l.trim()) } catch { return [] }
@@ -61,19 +81,24 @@ export class CodexProvider implements AgentProvider {
 
   private allFiles(): string[] { return this.roots.flatMap(walkRollouts) }
 
-  private metaOf(file: string): { id: string; cwd: string; firstPrompt: string; timestamp: string; messageCount: number } {
-    let cwd = '', firstPrompt = '', timestamp = '', id = idFromFile(file), messageCount = 0
+  private metaOf(file: string): { id: string; cwd: string; firstPrompt: string; timestamp: string; messageCount: number; model: string; effort: string; permission: string } {
+    let cwd = '', firstPrompt = '', timestamp = '', id = idFromFile(file), messageCount = 0, model = '', effort = '', permission = ''
     for (const line of readLines(file)) {
       let o: any; try { o = JSON.parse(line) } catch { continue }
       const p = o.payload || {}
-      if (o.type === 'session_meta') { cwd = p.cwd || cwd; id = p.session_id || p.id || id; timestamp = o.timestamp || p.timestamp || timestamp }
+      if (o.type === 'session_meta') { cwd = p.cwd || cwd; id = p.session_id || p.id || id; timestamp = o.timestamp || p.timestamp || timestamp; if (p.model) model = p.model }
+      else if (o.type === 'turn_context') { // last turn wins
+        if (p.model) model = p.model
+        const e = p.collaboration_mode?.settings?.reasoning_effort; effort = e || ''
+        const sb = p.sandbox_policy?.type; if (sb) permission = sb
+      }
       else if (o.type === 'response_item' && p.type === 'message' && p.role === 'user') {
         messageCount++
         const t = textOf(p.content)
         if (!firstPrompt && t && !t.trimStart().startsWith('<')) firstPrompt = t
       }
     }
-    return { id, cwd, firstPrompt, timestamp, messageCount }
+    return { id, cwd, firstPrompt, timestamp, messageCount, model, effort, permission }
   }
 
   private toSession(file: string, names: Map<string, { name?: string; updated?: string }>): Session | null {
@@ -86,7 +111,27 @@ export class CodexProvider implements AgentProvider {
       id: meta.id, project: meta.cwd || '(unknown)', encodedPath: encode(meta.cwd || ''),
       firstPrompt: (idx?.name || meta.firstPrompt || '').slice(0, 200),
       lastTimestamp: last, messageCount: meta.messageCount, source: SOURCE, name: idx?.name,
+      model: meta.model || undefined, effort: meta.effort || undefined, permission: meta.permission || undefined,
     }
+  }
+
+  /** Selectable models (slug + label + reasoning levels) from $CODEX_HOME/models_cache.json. */
+  listModels(): { slug: string; name: string; defaultEffort?: string; efforts: string[] }[] {
+    const byslug = new Map<string, { slug: string; name: string; defaultEffort?: string; efforts: string[] }>()
+    let data: any
+    try { data = JSON.parse(fs.readFileSync(path.join(this.configDir, 'models_cache.json'), 'utf-8')) } catch { return [] }
+    const visit = (o: any) => {
+      if (!o || typeof o !== 'object') return
+      if (Array.isArray(o)) { for (const x of o) visit(x); return }
+      const slug = o.slug || o.id || o.model
+      if (typeof slug === 'string' && (o.supported_reasoning_levels || o.default_reasoning_level)) {
+        const efforts = Array.isArray(o.supported_reasoning_levels) ? o.supported_reasoning_levels.map((e: any) => e?.effort).filter(Boolean) : []
+        if (!byslug.has(slug)) byslug.set(slug, { slug, name: o.display_name || o.displayName || slug, defaultEffort: o.default_reasoning_level, efforts })
+      }
+      for (const v of Object.values(o)) visit(v)
+    }
+    visit(data)
+    return Array.from(byslug.values())
   }
 
   listRecent(limit: number): Session[] {
@@ -166,5 +211,101 @@ export class CodexProvider implements AgentProvider {
       if (match) { const s = this.toSession(f, names); if (s) out.push({ session: s, match: match.slice(0, 200) }) }
     }
     return out
+  }
+
+  // --- Send (codex exec --json; codex mints the session id and writes its own rollout) ---
+
+  findBin(): string {
+    const home = os.homedir()
+    const envBin = (process.env.CODEX_BIN || '').trim()
+    if (envBin) { try { if (fs.existsSync(envBin)) return envBin } catch { /* fall through */ } }
+    try { return execFileSync('which', ['codex'], { encoding: 'utf-8' }).trim() } catch { /* not in PATH */ }
+    const nvmDefault = path.join(home, '.nvm/alias/default')
+    if (fs.existsSync(nvmDefault)) {
+      const version = fs.readFileSync(nvmDefault, 'utf-8').trim()
+      if (version) { const c = path.join(home, `.nvm/versions/node/${version}/bin/codex`); if (fs.existsSync(c)) return c }
+    }
+    const nvmVersionsDir = path.join(home, '.nvm/versions/node')
+    if (fs.existsSync(nvmVersionsDir)) {
+      try { for (const v of fs.readdirSync(nvmVersionsDir).sort().reverse()) { const c = path.join(nvmVersionsDir, v, 'bin/codex'); if (fs.existsSync(c)) return c } } catch { /* skip */ }
+    }
+    for (const c of ['/usr/local/bin/codex', '/opt/homebrew/bin/codex', path.join(home, '.local/bin/codex')]) { if (fs.existsSync(c)) return c }
+    return 'codex'
+  }
+
+  /**
+   * Build `codex exec` argv. New: `-s workspace-write -C <cwd>` (mirrors Claude acceptEdits).
+   * Resume: NO `-s`/`-C` (codex rejects them; it inherits the session sandbox and uses the
+   * process cwd) — the caller MUST set the spawn cwd to the session's project dir.
+   */
+  private buildArgs(opts: SendOpts, outFile?: string): string[] {
+    const a = ['--json', '--skip-git-repo-check']
+    if (outFile) a.push('-o', outFile)
+    if (opts.model) a.push('-m', opts.model)
+    // Codex does NOT auto-inherit model/effort on resume, so the caller passes the session's values explicitly.
+    if (opts.effort) a.push('-c', `model_reasoning_effort="${opts.effort}"`)
+    // Permission/sandbox. YOLO uses the bypass flag (the only thing that works on `resume`; `-s`/`-c sandbox_mode`
+    // are rejected/ignored there). Lower levels use `-s` on new chats (resume keeps codex's default).
+    const yolo = opts.sandbox === 'danger-full-access'
+    if (yolo) a.push('--dangerously-bypass-approvals-and-sandbox')
+    else a.push('-c', 'approval_policy="never"')
+    if (opts.mode === 'resume' && opts.sessionId) return ['exec', 'resume', opts.sessionId, ...a, opts.prompt]
+    const newFlags = yolo ? [] : ['-s', opts.sandbox || 'workspace-write']
+    return ['exec', ...newFlags, '-C', opts.cwd || process.cwd(), ...a, opts.prompt]
+  }
+
+  /** Headless blocking send. Reply from `-o` file (preferred) or the last agent_message; id from thread.started. */
+  send(opts: SendOpts): Promise<SendResult> {
+    const outFile = path.join(os.tmpdir(), `codex-last-${process.pid}-${Date.now()}.txt`)
+    const args = this.buildArgs(opts, outFile)
+    return new Promise((resolve, reject) => {
+      const child = spawn(this.findBin(), args, { cwd: opts.cwd || process.cwd(), stdio: ['ignore', 'pipe', 'pipe'], env: process.env })
+      let stdout = '', stderr = ''
+      child.stdout.setEncoding('utf-8'); child.stdout.on('data', d => { stdout += d })
+      child.stderr.setEncoding('utf-8'); child.stderr.on('data', d => { stderr += d })
+      child.on('error', e => reject(e))
+      child.on('close', (code) => {
+        let sessionId = opts.sessionId || '', response = ''
+        for (const line of stdout.split('\n')) {
+          const t = line.trim(); if (!t) continue
+          let o: any; try { o = JSON.parse(t) } catch { continue }
+          if (o.type === 'thread.started' && o.thread_id) sessionId = o.thread_id
+          else if (o.type === 'item.completed' && o.item?.type === 'agent_message' && o.item.text) response = o.item.text
+        }
+        try { const f = fs.readFileSync(outFile, 'utf-8').trim(); if (f) response = f } catch { /* keep parsed */ }
+        try { fs.unlinkSync(outFile) } catch { /* */ }
+        if (code && code !== 0 && !response && !sessionId) { reject(new Error(stderr.trim() || `codex exited with code ${code}`)); return }
+        resolve({ sessionId, response, costUsd: 0 })
+      })
+    })
+  }
+
+  /** Streaming send via `codex exec --json`; maps thread/item events onto the common callbacks. */
+  sendStreaming(opts: SendOpts, cbs: StreamCallbacks): StreamHandle | null {
+    const args = this.buildArgs(opts)
+    const child = spawn(this.findBin(), args, { cwd: opts.cwd || process.cwd(), stdio: ['ignore', 'pipe', 'pipe'], env: process.env })
+    let sid = opts.sessionId || '', buf = '', stderr = ''
+    child.stdout.setEncoding('utf-8')
+    child.stdout.on('data', (chunk: string) => {
+      buf += chunk
+      let nl: number
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim(); buf = buf.slice(nl + 1)
+        if (!line) continue
+        let o: any; try { o = JSON.parse(line) } catch { continue }
+        if (o.type === 'thread.started' && o.thread_id) { sid = o.thread_id; cbs.onSession(sid) }
+        else if (o.type === 'item.completed' || o.type === 'item.started' || o.type === 'item.updated') {
+          const it = o.item; if (!it) continue
+          if (it.type === 'agent_message') { if (o.type === 'item.completed' && it.text) cbs.onDelta(it.text) }
+          else { const tu = codexItemToTool(it); if (tu) cbs.onToolUse(tu) }
+        }
+      }
+    })
+    child.stderr.setEncoding('utf-8'); child.stderr.on('data', (d: string) => { stderr += d })
+    const done = new Promise<void>((resolve) => {
+      child.on('error', (e) => { cbs.onError(e.message); resolve() })
+      child.on('close', (code) => { if (code && code !== 0 && stderr) cbs.onError(stderr.trim().slice(0, 500)); cbs.onDone({ sessionId: sid, costUsd: 0 }); resolve() })
+    })
+    return { wait: () => done, kill: () => { try { child.kill('SIGKILL') } catch { /* */ } } }
   }
 }

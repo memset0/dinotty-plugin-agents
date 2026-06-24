@@ -26,13 +26,13 @@ export async function projectSessions(exec: ExecFn, projectPath: string): Promis
   return JSON.parse(res.stdout)
 }
 
-/** Resolved-in-use config dirs / binary (for prefilling the settings panel). */
-export async function getConfig(exec: ExecFn): Promise<{ claudeConfigDir: string; codexHome: string; claudeBin: string }> {
+/** Resolved-in-use config dirs / binaries (for prefilling the settings panel). */
+export async function getConfig(exec: ExecFn): Promise<{ claudeConfigDir: string; codexHome: string; claudeBin: string; codexBin: string }> {
   try {
     const res = await exec(['config'])
-    if (res.code === 0) return JSON.parse(res.stdout)
+    if (res.code === 0) { const c = JSON.parse(res.stdout); return { claudeConfigDir: c.claudeConfigDir || '', codexHome: c.codexHome || '', claudeBin: c.claudeBin || '', codexBin: c.codexBin || '' } }
   } catch { /* fall through */ }
-  return { claudeConfigDir: '', codexHome: '', claudeBin: '' }
+  return { claudeConfigDir: '', codexHome: '', claudeBin: '', codexBin: '' }
 }
 
 export async function searchSessions(exec: ExecFn, query: string): Promise<SearchResult[]> {
@@ -59,4 +59,14 @@ export async function listDirs(exec: ExecFn, dirPath: string): Promise<{ name: s
   const res = await exec(['list-dirs', dirPath], { timeout: 5_000 })
   if (res.code !== 0) return []
   try { return JSON.parse(res.stdout) } catch { return [] }
+}
+
+export interface ModelInfo { slug: string; name: string; defaultEffort?: string; efforts: string[] }
+
+export async function listModels(exec: ExecFn, source: string): Promise<ModelInfo[]> {
+  try {
+    const res = await exec(['list-models', source], { timeout: 5_000 })
+    if (res.code === 0) return JSON.parse(res.stdout)
+  } catch { /* */ }
+  return []
 }
