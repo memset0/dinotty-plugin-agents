@@ -1,0 +1,4 @@
+# pnpm settings (pnpm v11 reads the build-script allowlist here, not from package.json).
+# esbuild's postinstall installs its native binary, so it must be allowed to build.
+allowBuilds:
+  esbuild: true
