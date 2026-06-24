@@ -54,6 +54,8 @@ export function activate(ctx: PluginContext): PluginExports {
   const pickerCurrentDir = ctx.ref('/')
   const pickerEntries = ctx.ref<{ name: string; path: string }[]>([])
   const pickerLoading = ctx.ref(false)
+  const showSettings = ctx.ref(false)
+  const settings = ctx.ref<{ claudeConfigDir: string; codexHome: string; claudeBin: string }>({ claudeConfigDir: '', codexHome: '', claudeBin: '' })
 
   // --- Computed ---
   const fileChanges = ctx.computed(() => aggregateFileChanges(messages.value))
@@ -178,9 +180,34 @@ export function activate(ctx: PluginContext): PluginExports {
     cmd.action()
   }
 
-  // --- Exec helper ---
-  function exec(args: string[], options?: { timeout?: number; cwd?: string }) {
-    return ctx.exec.run(args, options)
+  // --- Exec helper (injects the configured per-agent dirs / binary as env) ---
+  function settingsEnv(): Record<string, string> {
+    const s = settings.value, env: Record<string, string> = {}
+    if (s.claudeConfigDir && s.claudeConfigDir.trim()) env.CLAUDE_CONFIG_DIR = s.claudeConfigDir.trim()
+    if (s.codexHome && s.codexHome.trim()) env.CODEX_HOME = s.codexHome.trim()
+    if (s.claudeBin && s.claudeBin.trim()) env.CLAUDE_BIN = s.claudeBin.trim()
+    return env
+  }
+  function exec(args: string[], options?: { timeout?: number; cwd?: string; env?: Record<string, string> }) {
+    return ctx.exec.run(args, { ...options, env: { ...settingsEnv(), ...(options?.env || {}) } })
+  }
+  async function loadSettings() {
+    try {
+      const saved = await ctx.storage.get<any>('settings')
+      if (saved && typeof saved === 'object') {
+        settings.value = {
+          claudeConfigDir: saved.claudeConfigDir || '',
+          codexHome: saved.codexHome || '',
+          claudeBin: saved.claudeBin || '',
+        }
+      }
+    } catch { /* use defaults */ }
+  }
+  async function saveSettings() {
+    try { await ctx.storage.set('settings', settings.value) } catch { /* ignore */ }
+    showSettings.value = false
+    loadRecentSessions()
+    loadProjects()
   }
 
   // Source badge: distinguishes Claude Code vs Codex sessions.
@@ -512,6 +539,7 @@ export function activate(ctx: PluginContext): PluginExports {
         ),
       ]),
       h('div', { class: 'ccm-header-right' }, [
+        h('button', { class: 'ccm-icon-btn', onClick: () => { showSettings.value = true }, title: 'Settings' }, IconSettings(16)),
         costTotal.value > 0 ? h('span', { class: 'ccm-cost-badge' }, `$${costTotal.value.toFixed(3)}`) : null,
         fileChanges.value.length > 0 ? h('button', {
           class: `ccm-icon-btn ${changesPanelOpen.value ? 'ccm-icon-btn-active' : ''}`,
@@ -563,7 +591,6 @@ export function activate(ctx: PluginContext): PluginExports {
           h('span', { class: 'ccm-project-chevron' }, selectedProject.value === p.path ? IconChevronDown(12) : IconChevronRight(12)),
           h('span', { class: 'ccm-project-icon' }, IconFolder(14)),
           h('span', { class: 'ccm-project-label' }, p.path.split('/').pop() || p.path),
-          ...((p.sources || []).map(srcBadge)),
           h('span', { class: 'ccm-project-count' }, String(p.sessionCount)),
         ]),
         selectedProject.value === p.path ? h('div', { class: 'ccm-session-list' },
@@ -1136,8 +1163,7 @@ export function activate(ctx: PluginContext): PluginExports {
       setup() {
         ctx.onMounted(() => {
           console.log('[agents-view] onMounted called')
-          loadRecentSessions()
-          loadProjects()
+          loadSettings().then(() => { loadRecentSessions(); loadProjects() })
           // Pre-load skills for slash command palette
           listSkills(exec).then(s => { skillsList.value = s }).catch(() => {})
           document.addEventListener('keydown', handleGlobalKeydown)
@@ -1159,9 +1185,41 @@ export function activate(ctx: PluginContext): PluginExports {
           renderStatusBar(),
           showProjectPicker.value ? renderProjectPicker() : null,
           showSkillsPanel.value ? renderSkillsPanel() : null,
+          showSettings.value ? renderSettings() : null,
         ])
       },
     },
+  }
+
+  function renderSettings() {
+    const field = (label: string, key: 'claudeConfigDir' | 'codexHome' | 'claudeBin', placeholder: string) =>
+      h('div', { style: 'margin-bottom:12px' }, [
+        h('label', { style: 'display:block;font-size:12px;opacity:.7;margin-bottom:4px' }, label),
+        h('input', {
+          type: 'text', class: 'ccm-browse-search-input', style: 'width:100%', value: settings.value[key], placeholder,
+          onInput: (e: Event) => { settings.value = { ...settings.value, [key]: (e.target as HTMLInputElement).value } },
+        }),
+      ])
+    return h('div', { class: 'ccm-picker-overlay' }, [
+      h('div', { class: 'ccm-picker-backdrop', onClick: () => { showSettings.value = false } }),
+      h('div', { class: 'ccm-picker-panel' }, [
+        h('div', { class: 'ccm-picker-header' }, [
+          h('span', { class: 'ccm-picker-title' }, 'Settings'),
+          h('button', { class: 'ccm-icon-btn ccm-icon-btn-sm', onClick: () => { showSettings.value = false } }, IconX(14)),
+        ]),
+        h('div', { style: 'padding:14px' }, [
+          field('Claude config dir (CLAUDE_CONFIG_DIR)', 'claudeConfigDir', '~/.claude or /root/.claude'),
+          field('Codex home (CODEX_HOME)', 'codexHome', '~/.codex'),
+          field('Claude binary (CLAUDE_BIN)', 'claudeBin', 'auto-detect if empty'),
+          h('div', { style: 'font-size:11px;opacity:.55;margin-bottom:12px;line-height:1.5' },
+            'Empty = use the env var / default. Reading another user’s dir (e.g. /root/.claude) requires the dinotty user to have FS read access (ACL grant).'),
+          h('div', { style: 'display:flex;gap:8px;justify-content:flex-end' }, [
+            h('button', { class: 'ccm-icon-btn', onClick: () => { showSettings.value = false } }, 'Cancel'),
+            h('button', { class: 'ccm-primary-btn ccm-primary-btn-sm', onClick: () => saveSettings() }, 'Save'),
+          ]),
+        ]),
+      ]),
+    ])
   }
 
   function renderBrowseView() {

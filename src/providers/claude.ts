@@ -244,6 +244,8 @@ export class ClaudeProvider implements AgentProvider {
 
   findBin(): string {
     const home = os.homedir()
+    const envBin = (process.env.CLAUDE_BIN || '').trim()
+    if (envBin) { try { if (fs.existsSync(envBin)) return envBin } catch { /* fall through */ } }
     try { return execFileSync('which', ['claude'], { encoding: 'utf-8' }).trim() } catch { /* not in PATH */ }
     const nvmDefault = path.join(home, '.nvm/alias/default')
     if (fs.existsSync(nvmDefault)) {
