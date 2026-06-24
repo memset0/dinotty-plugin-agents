@@ -57,7 +57,7 @@ export function activate(ctx: PluginContext): PluginExports {
   const pickerEntries = ctx.ref<{ name: string; path: string }[]>([])
   const pickerLoading = ctx.ref(false)
   const showSettings = ctx.ref(false)
-  const settings = ctx.ref<{ claudeConfigDir: string; codexHome: string; claudeBin: string; codexBin: string }>({ claudeConfigDir: '', codexHome: '', claudeBin: '', codexBin: '' })
+  const settings = ctx.ref<{ claudeConfigDir: string; codexHome: string; claudeBin: string; codexBin: string; minimalMode: boolean }>({ claudeConfigDir: '', codexHome: '', claudeBin: '', codexBin: '', minimalMode: false })
   const favProjects = ctx.ref<Set<string>>(new Set())
   const favSessions = ctx.ref<Set<string>>(new Set())
   // Agent for a *new* chat (existing sessions use their own source). Streaming handle for real Stop.
@@ -72,12 +72,8 @@ export function activate(ctx: PluginContext): PluginExports {
   // --- Computed ---
   const fileChanges = ctx.computed(() => aggregateFileChanges(messages.value))
 
-  // Auto-expand all files when changes appear
-  ctx.watch(fileChanges, (changes) => {
-    if (changes.length > 0) {
-      expandedFiles.value = new Set(changes.map(c => c.filePath))
-    }
-  })
+  // Files start COLLAPSED. A file's diff (renderFileDiff) is computed/rendered only when
+  // the user expands it, so opening the changes panel stays cheap even with many files.
 
   // --- Slash commands ---
   interface SlashCmd { name: string; desc: string; action: () => void }
@@ -224,6 +220,7 @@ export function activate(ctx: PluginContext): PluginExports {
       codexHome: saved.codexHome || def.codexHome || '',
       claudeBin: saved.claudeBin || def.claudeBin || '',
       codexBin: saved.codexBin || def.codexBin || '',
+      minimalMode: !!saved.minimalMode,
     }
   }
   async function loadModels() {
@@ -796,8 +793,10 @@ export function activate(ctx: PluginContext): PluginExports {
         }, [
           h('span', { class: 'ccm-project-chevron' }, selectedProject.value === p.path ? IconChevronDown(12) : IconChevronRight(12)),
           h('span', { class: 'ccm-project-icon' }, IconFolder(14)),
-          h('span', { class: 'ccm-project-label' }, p.path.split('/').pop() || p.path),
-          h('span', { style: 'opacity:.5;font-size:11px;margin-left:5px;font-variant-numeric:tabular-nums;flex:0 0 auto' }, `(${p.sessionCount})`),
+          h('span', { class: 'ccm-project-label' }, [
+            p.path.split('/').pop() || p.path,
+            h('span', { style: 'opacity:.5;font-size:11px;margin-left:5px;font-variant-numeric:tabular-nums' }, `(${p.sessionCount})`),
+          ]),
           h('span', { style: 'margin-left:auto;display:flex;align-items:center' }, starBtn(favProjects.value.has(p.path), () => toggleFavProject(p.path))),
         ]),
         selectedProject.value === p.path ? h('div', { class: 'ccm-session-list' },
@@ -898,28 +897,39 @@ export function activate(ctx: PluginContext): PluginExports {
     const isUser = msg.role === 'user'
     const prevRole = index > 0 ? messages.value[index - 1].role : null
     const showDivider = prevRole !== null && prevRole !== msg.role
+    const minimal = settings.value.minimalMode
+    const hasContent = !!(msg.content && msg.content.trim())
+
+    const body = h('div', { class: 'ccm-message-body' }, [
+      // Top meta (role / model / time) — normal mode only.
+      minimal ? null : h('div', { class: 'ccm-message-meta' }, [
+        h('span', { class: 'ccm-message-role' }, isUser ? 'You' : (msg.source === 'codex' ? 'Codex' : 'Claude')),
+        msg.model ? h('span', { class: 'ccm-model-tag' }, msg.model) : null,
+        h('span', { class: 'ccm-message-time' }, formatTime(msg.timestamp)),
+      ].filter(Boolean)),
+      // Content — skipped entirely when empty (e.g. a tool-only turn) so no "(no content)" shows.
+      hasContent ? h('div', { class: 'ccm-message-content' }, renderMarkdown(msg.content)) : null,
+      // Tool cards.
+      msg.toolUses && msg.toolUses.length > 0
+        ? h('div', { class: 'ccm-tools-section' }, msg.toolUses.map((t, i) => renderToolCard(msg.uuid, t, i)))
+        : null,
+      // Minimal mode: under each agent message show model (bottom-left) + time (bottom-right); no role text.
+      (minimal && !isUser) ? h('div', { class: 'ccm-message-footer', style: 'display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:4px;font-size:11px;opacity:.5' }, [
+        h('span', null, msg.model || ''),
+        h('span', { style: 'font-variant-numeric:tabular-nums' }, formatTime(msg.timestamp)),
+      ]) : null,
+    ].filter(Boolean))
 
     return h('div', { class: `ccm-message ${isUser ? 'ccm-message-user' : 'ccm-message-assistant'}` }, [
       showDivider ? h('div', { class: 'ccm-divider' }) : null,
-      h('div', { class: 'ccm-message-gutter' }, [
+      // Avatar gutter — hidden in minimal mode.
+      minimal ? null : h('div', { class: 'ccm-message-gutter' }, [
         h('div', { class: `ccm-avatar ${isUser ? 'ccm-avatar-user' : 'ccm-avatar-assistant'}` },
           isUser ? IconUser(16) : IconClaude(16)
         ),
       ]),
-      h('div', { class: 'ccm-message-body' }, [
-        h('div', { class: 'ccm-message-meta' }, [
-          h('span', { class: 'ccm-message-role' }, isUser ? 'You' : (msg.source === 'codex' ? 'Codex' : 'Claude')),
-          msg.model ? h('span', { class: 'ccm-model-tag' }, msg.model) : null,
-          h('span', { class: 'ccm-message-time' }, formatTime(msg.timestamp)),
-        ].filter(Boolean)),
-        h('div', { class: 'ccm-message-content' }, renderMarkdown(msg.content)),
-        msg.toolUses && msg.toolUses.length > 0
-          ? h('div', { class: 'ccm-tools-section' },
-              msg.toolUses.map((t, i) => renderToolCard(msg.uuid, t, i))
-            )
-          : null,
-      ]),
-    ])
+      body,
+    ].filter(Boolean))
   }
 
   function renderToolCard(msgId: string, tool: ToolUse, index: number) {
@@ -1128,7 +1138,7 @@ export function activate(ctx: PluginContext): PluginExports {
           h('span', { class: 'ccm-change-filename' }, fileName),
           h('span', { class: 'ccm-change-dir' }, dirPath),
         ]),
-        renderDiffChanges(change.additions, change.deletions, 'bars'),
+        renderDiffChanges(change.additions, change.deletions, 'default'),
       ]),
       expanded ? renderFileDiff(change) : null,
     ])
@@ -1456,6 +1466,18 @@ export function activate(ctx: PluginContext): PluginExports {
           section('Codex', [
             field('Home (CODEX_HOME)', 'codexHome', '~/.codex'),
             field('Binary (CODEX_BIN)', 'codexBin', 'auto-detect if empty'),
+          ]),
+          section('Appearance', [
+            h('label', { style: 'display:flex;align-items:flex-start;gap:8px;font-size:13px;cursor:pointer' }, [
+              h('input', {
+                type: 'checkbox', style: 'margin-top:2px', checked: settings.value.minimalMode,
+                onChange: (e: Event) => { settings.value = { ...settings.value, minimalMode: (e.target as HTMLInputElement).checked } },
+              }),
+              h('span', null, [
+                h('div', null, 'Minimal mode'),
+                h('div', { style: 'font-size:11px;opacity:.55;line-height:1.4' }, 'Hide avatars and role labels; show model name (bottom-left) and time (bottom-right) under each agent message.'),
+              ]),
+            ]),
           ]),
           h('div', { style: 'font-size:11px;opacity:.55;line-height:1.5' },
             'Prefilled with the values currently in use. Reading another user’s dir (e.g. /root/.claude) requires the dinotty process to have read access — run dinotty as that user, or grant an ACL.'),
