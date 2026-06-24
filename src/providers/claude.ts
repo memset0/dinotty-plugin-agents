@@ -102,10 +102,22 @@ function readSessionMeta(filePath: string, id: string, encodedPath: string): Ses
     try { lastTimestamp = fs.statSync(filePath).mtime.toISOString() } catch { /* skip */ }
   }
   const messageCount = lines.filter(l => l.includes('"type":"user"')).length
+  // Real session title: the last `custom-title` (this customized Claude Code) or
+  // `summary` (stock). UI falls back to firstPrompt when absent.
+  let name = ''
+  for (const line of lines) {
+    if (line.indexOf('"custom-title"') < 0 && line.indexOf('"type":"summary"') < 0) continue
+    try {
+      const o = JSON.parse(line)
+      if (o.type === 'custom-title' && o.customTitle) name = o.customTitle
+      else if (o.type === 'summary' && o.summary) name = o.summary
+    } catch { /* skip */ }
+  }
   return {
     id, project: cwd || fallbackDecode(encodedPath), encodedPath,
     firstPrompt: firstPrompt.slice(0, 200), lastTimestamp, messageCount,
     gitBranch: gitBranch || undefined, source: SOURCE,
+    name: name || undefined,
   }
 }
 
