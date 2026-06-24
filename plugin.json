@@ -1,0 +1,17 @@
+{
+  "id": "agents-view",
+  "name": "Agents View",
+  "version": "1.0.0",
+  "description": "Unified visual session view for coding agents — Claude Code today; Codex and opencode planned",
+  "description_zh": "多 Agent 可视化会话视图 — 浏览历史、新建与恢复会话（当前 Claude Code，Codex / opencode 规划中）",
+  "icon": "message-square",
+  "entry": "./dist/main.js",
+  "bin": { "mode": "cli", "entry": "dist/cli-wrapper" },
+  "styles": "./styles.css",
+  "commands": [
+    { "id": "agents-view.open", "title": "Open Agents View" },
+    { "id": "agents-view.new", "title": "New Agent Chat" },
+    { "id": "agents-view.search", "title": "Search Agent Conversations" },
+    { "id": "agents-view.quick", "title": "Quick Switch Agent Session" }
+  ]
+}

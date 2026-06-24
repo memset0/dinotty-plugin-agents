@@ -1,0 +1,1232 @@
+#!/usr/bin/env node
+var __create = Object.create;
+var __defProp = Object.defineProperty;
+var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __getOwnPropNames = Object.getOwnPropertyNames;
+var __getProtoOf = Object.getPrototypeOf;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __copyProps = (to, from, except, desc) => {
+  if (from && typeof from === "object" || typeof from === "function") {
+    for (let key of __getOwnPropNames(from))
+      if (!__hasOwnProp.call(to, key) && key !== except)
+        __defProp(to, key, { get: () => from[key], enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable });
+  }
+  return to;
+};
+var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__getProtoOf(mod)) : {}, __copyProps(
+  // If the importer is in node compatibility mode or this is not an ESM
+  // file that has been converted to a CommonJS file using a Babel-
+  // compatible transform (i.e. "__esModule" has not been set), then set
+  // "default" to the CommonJS "module.exports" for node compatibility.
+  isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
+  mod
+));
+
+// src/history-cli.ts
+var fs3 = __toESM(require("fs"));
+var path4 = __toESM(require("path"));
+var os4 = __toESM(require("os"));
+
+// src/providers/claude.ts
+var fs = __toESM(require("fs"));
+var path2 = __toESM(require("path"));
+var os2 = __toESM(require("os"));
+var import_child_process = require("child_process");
+var import_crypto = require("crypto");
+
+// src/providers/base.ts
+var os = __toESM(require("os"));
+var path = __toESM(require("path"));
+function expandHome(p) {
+  if (p === "~") return os.homedir();
+  if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
+  return p;
+}
+function resolveAgentDir(envVar, defaultRel) {
+  const env = process.env[envVar];
+  if (env && env.trim()) return expandHome(env.trim());
+  return path.join(os.homedir(), defaultRel);
+}
+
+// src/providers/claude.ts
+var SOURCE = "claude-code";
+function readLines(filePath) {
+  try {
+    return fs.readFileSync(filePath, "utf-8").split("\n").filter((l) => l.trim());
+  } catch {
+    return [];
+  }
+}
+function fallbackDecode(encodedPath) {
+  return "/" + encodedPath.replace(/^-/, "").replace(/-/g, "/");
+}
+function summarizeTool(name, input) {
+  if (!input) return name;
+  switch (name) {
+    case "Bash":
+      return (input.command || name).slice(0, 80);
+    case "Read":
+      return input.file_path || name;
+    case "Edit":
+      return input.file_path || name;
+    case "Write":
+      return input.file_path || name;
+    case "Grep":
+      return input.pattern || name;
+    case "Glob":
+      return input.pattern || name;
+    case "Agent":
+      return (input.description || name).slice(0, 60);
+    case "WebFetch":
+      return (input.url || name).slice(0, 60);
+    case "WebSearch":
+      return (input.query || name).slice(0, 60);
+    default:
+      return name;
+  }
+}
+function parseMessage(obj) {
+  if (obj.type === "user") {
+    if (typeof obj.message?.content !== "string") return null;
+    return { uuid: obj.uuid || "", role: "user", content: obj.message.content, timestamp: obj.timestamp || "", source: SOURCE };
+  }
+  if (obj.type === "assistant") {
+    const content = obj.message?.content || [];
+    const textParts = [];
+    const toolUses = [];
+    for (const block of content) {
+      if (block.type === "text") textParts.push(block.text);
+      else if (block.type === "tool_use") {
+        const tu = { name: block.name, summary: summarizeTool(block.name, block.input) };
+        if (block.name === "Edit" && block.input) {
+          tu.filePath = block.input.file_path || "";
+          tu.oldString = block.input.old_string || "";
+          tu.newString = block.input.new_string || "";
+          tu.replaceAll = block.input.replace_all || false;
+        } else if (block.name === "Write" && block.input) {
+          tu.filePath = block.input.file_path || "";
+          tu.content = block.input.content || "";
+        }
+        toolUses.push(tu);
+      }
+    }
+    return {
+      uuid: obj.uuid || "",
+      role: "assistant",
+      content: textParts.join("\n"),
+      timestamp: obj.timestamp || "",
+      model: obj.message?.model,
+      toolUses: toolUses.length > 0 ? toolUses : void 0,
+      source: SOURCE
+    };
+  }
+  return null;
+}
+function readSessionMeta(filePath, id, encodedPath) {
+  const lines = readLines(filePath);
+  if (lines.length === 0) return null;
+  let firstPrompt = "", gitBranch = "", firstTimestamp = "", cwd = "";
+  for (const line of lines.slice(0, 30)) {
+    try {
+      const obj = JSON.parse(line);
+      if (!cwd && obj.cwd) cwd = obj.cwd;
+      if (obj.type === "user" && typeof obj.message?.content === "string") {
+        firstPrompt = obj.message.content;
+        gitBranch = obj.gitBranch || "";
+        firstTimestamp = obj.timestamp || "";
+        if (obj.cwd) cwd = obj.cwd;
+        break;
+      }
+    } catch {
+    }
+  }
+  if (!cwd) {
+    for (const line of lines) {
+      try {
+        const obj = JSON.parse(line);
+        if (obj.cwd) {
+          cwd = obj.cwd;
+          break;
+        }
+      } catch {
+      }
+    }
+  }
+  try {
+    const last = JSON.parse(lines[lines.length - 1]);
+    if (last.type === "last-prompt" && last.lastPrompt && !firstPrompt) firstPrompt = last.lastPrompt;
+  } catch {
+  }
+  let lastTimestamp = firstTimestamp;
+  if (!lastTimestamp) {
+    try {
+      lastTimestamp = fs.statSync(filePath).mtime.toISOString();
+    } catch {
+    }
+  }
+  const messageCount = lines.filter((l) => l.includes('"type":"user"')).length;
+  let name = "";
+  for (const line of lines) {
+    if (line.indexOf('"custom-title"') < 0 && line.indexOf('"type":"summary"') < 0) continue;
+    try {
+      const o = JSON.parse(line);
+      if (o.type === "custom-title" && o.customTitle) name = o.customTitle;
+      else if (o.type === "summary" && o.summary) name = o.summary;
+    } catch {
+    }
+  }
+  return {
+    id,
+    project: cwd || fallbackDecode(encodedPath),
+    encodedPath,
+    firstPrompt: firstPrompt.slice(0, 200),
+    lastTimestamp,
+    messageCount,
+    gitBranch: gitBranch || void 0,
+    source: SOURCE,
+    name: name || void 0
+  };
+}
+var ClaudeProvider = class {
+  source = SOURCE;
+  configDir = resolveAgentDir("CLAUDE_CONFIG_DIR", ".claude");
+  get projectsDir() {
+    return path2.join(this.configDir, "projects");
+  }
+  get skillsDir() {
+    return path2.join(this.configDir, "skills");
+  }
+  available() {
+    try {
+      return fs.existsSync(this.projectsDir);
+    } catch {
+      return false;
+    }
+  }
+  listProjects() {
+    if (!this.available()) return [];
+    const projects = [];
+    for (const entry of fs.readdirSync(this.projectsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+      const dir = path2.join(this.projectsDir, entry.name);
+      try {
+        const files = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl"));
+        if (files.length === 0) continue;
+        let projectPath = fallbackDecode(entry.name);
+        for (const file of files) {
+          for (const line of readLines(path2.join(dir, file)).slice(0, 10)) {
+            try {
+              const obj = JSON.parse(line);
+              if (obj.cwd) {
+                projectPath = obj.cwd;
+                break;
+              }
+            } catch {
+            }
+          }
+          if (projectPath !== fallbackDecode(entry.name)) break;
+        }
+        projects.push({ path: projectPath, encodedPath: entry.name, sessionCount: files.length, source: SOURCE });
+      } catch {
+      }
+    }
+    return projects.sort((a, b) => b.sessionCount - a.sessionCount);
+  }
+  listSessions(encodedPath) {
+    const dir = path2.join(this.projectsDir, encodedPath);
+    if (!fs.existsSync(dir)) return [];
+    const files = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl")).map((f) => ({ name: f, mtime: fs.statSync(path2.join(dir, f)).mtime.getTime() })).sort((a, b) => b.mtime - a.mtime);
+    const sessions = [];
+    for (const file of files) {
+      const id = file.name.replace(".jsonl", "");
+      if (id.length < 10) continue;
+      const meta = readSessionMeta(path2.join(dir, file.name), id, encodedPath);
+      if (meta) sessions.push(meta);
+    }
+    return sessions;
+  }
+  listSessionsByProject(projectPath) {
+    const proj = this.listProjects().find((p) => p.path === projectPath);
+    return proj ? this.listSessions(proj.encodedPath) : [];
+  }
+  readSession(encodedPath, sessionId) {
+    const filePath = path2.join(this.projectsDir, encodedPath, `${sessionId}.jsonl`);
+    const messages = [];
+    for (const line of readLines(filePath)) {
+      try {
+        const msg = parseMessage(JSON.parse(line));
+        if (msg) messages.push(msg);
+      } catch {
+      }
+    }
+    return messages;
+  }
+  search(query, limit) {
+    if (!this.available()) return [];
+    const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(escaped, "i");
+    const results = [];
+    for (const proj of fs.readdirSync(this.projectsDir, { withFileTypes: true })) {
+      if (!proj.isDirectory() || proj.name.startsWith(".")) continue;
+      const dir = path2.join(this.projectsDir, proj.name);
+      try {
+        for (const file of fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl"))) {
+          if (results.length >= limit) break;
+          const filePath = path2.join(dir, file);
+          let matchText = "";
+          for (const line of readLines(filePath)) {
+            if (!re.test(line)) continue;
+            try {
+              const obj = JSON.parse(line);
+              if (obj.type === "user" && typeof obj.message?.content === "string") matchText = obj.message.content;
+              else if (obj.type === "assistant") matchText = (obj.message?.content || []).filter((b) => b.type === "text").map((b) => b.text).join(" ");
+            } catch {
+              matchText = line.slice(0, 100);
+            }
+            break;
+          }
+          if (matchText) {
+            const session = readSessionMeta(filePath, file.replace(".jsonl", ""), proj.name);
+            if (session) results.push({ session, match: matchText.slice(0, 200) });
+          }
+        }
+      } catch {
+      }
+    }
+    return results;
+  }
+  listRecent(limit) {
+    if (!this.available()) return [];
+    const all = [];
+    for (const entry of fs.readdirSync(this.projectsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+      const dir = path2.join(this.projectsDir, entry.name);
+      try {
+        const files = fs.readdirSync(dir).filter((f) => f.endsWith(".jsonl")).map((f) => ({ name: f, mtime: fs.statSync(path2.join(dir, f)).mtime.getTime() })).sort((a, b) => b.mtime - a.mtime);
+        for (const file of files) {
+          const id = file.name.replace(".jsonl", "");
+          if (id.length < 10) continue;
+          const meta = readSessionMeta(path2.join(dir, file.name), id, entry.name);
+          if (meta) all.push(meta);
+        }
+      } catch {
+      }
+    }
+    return all.sort((a, b) => ts(b.lastTimestamp) - ts(a.lastTimestamp)).slice(0, limit);
+  }
+  // --- Claude-specific (skills + send), kept on the provider ---
+  listSkills() {
+    if (!fs.existsSync(this.skillsDir)) return [];
+    const skills = [];
+    for (const entry of fs.readdirSync(this.skillsDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+      try {
+        const raw = fs.readFileSync(path2.join(this.skillsDir, entry.name, "SKILL.md"), "utf-8");
+        const meta = parseFrontmatter(raw);
+        let description = meta.description || "";
+        if (!description) {
+          const afterFm = raw.replace(/^---\n[\s\S]*?\n---\n?/, "");
+          const line = afterFm.split("\n").find((l) => l.trim() && !l.startsWith("#"));
+          if (line) description = line.trim().slice(0, 200);
+        }
+        skills.push({ id: entry.name, name: meta.name || entry.name, description, allowedTools: meta.allowedTools || [] });
+      } catch {
+      }
+    }
+    return skills;
+  }
+  findBin() {
+    const home = os2.homedir();
+    const envBin = (process.env.CLAUDE_BIN || "").trim();
+    if (envBin) {
+      try {
+        if (fs.existsSync(envBin)) return envBin;
+      } catch {
+      }
+    }
+    try {
+      return (0, import_child_process.execFileSync)("which", ["claude"], { encoding: "utf-8" }).trim();
+    } catch {
+    }
+    const nvmDefault = path2.join(home, ".nvm/alias/default");
+    if (fs.existsSync(nvmDefault)) {
+      const version = fs.readFileSync(nvmDefault, "utf-8").trim();
+      if (version) {
+        const nvmClaude = path2.join(home, `.nvm/versions/node/${version}/bin/claude`);
+        if (fs.existsSync(nvmClaude)) return nvmClaude;
+      }
+    }
+    const nvmVersionsDir = path2.join(home, ".nvm/versions/node");
+    if (fs.existsSync(nvmVersionsDir)) {
+      try {
+        for (const v of fs.readdirSync(nvmVersionsDir).sort().reverse()) {
+          const candidate = path2.join(nvmVersionsDir, v, "bin/claude");
+          if (fs.existsSync(candidate)) return candidate;
+        }
+      } catch {
+      }
+    }
+    for (const c of ["/usr/local/bin/claude", "/opt/homebrew/bin/claude", path2.join(home, ".local/bin/claude")]) {
+      if (fs.existsSync(c)) return c;
+    }
+    return "claude";
+  }
+  /** Build the claude argv shared by the blocking and streaming paths. */
+  buildArgs(opts, outputFormat) {
+    const sessionId = opts.mode === "new" ? opts.sessionId || (0, import_crypto.randomUUID)() : opts.sessionId || "";
+    const args2 = ["-p", opts.prompt, "--output-format", outputFormat, "--permission-mode", "acceptEdits"];
+    if (outputFormat === "stream-json") args2.push("--verbose");
+    if (opts.mode === "new") {
+      args2.push("--session-id", sessionId, "--model", opts.model || "sonnet");
+    } else {
+      args2.push("--resume", opts.sessionId);
+      if (opts.model) args2.push("--model", opts.model);
+    }
+    return { args: args2, sessionId };
+  }
+  /** Headless blocking send (--output-format json). */
+  send(opts) {
+    const { args: args2, sessionId } = this.buildArgs(opts, "json");
+    return new Promise((resolve, reject) => {
+      (0, import_child_process.execFile)(this.findBin(), args2, { cwd: opts.cwd, timeout: 6e5, maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err && !stdout) {
+          reject(new Error(stderr || err.message));
+          return;
+        }
+        try {
+          const data = JSON.parse(stdout);
+          resolve({ sessionId: data.session_id || sessionId, response: data.result || "", costUsd: data.total_cost_usd || data.cost_usd || 0 });
+        } catch {
+          resolve({ sessionId, response: stdout.trim(), costUsd: 0 });
+        }
+      });
+    });
+  }
+  /** Streaming send via `--output-format stream-json`; maps claude events onto the common callbacks. */
+  sendStreaming(opts, cbs) {
+    const { args: args2, sessionId } = this.buildArgs(opts, "stream-json");
+    const child = (0, import_child_process.spawn)(this.findBin(), args2, { cwd: opts.cwd, stdio: ["ignore", "pipe", "pipe"], env: process.env });
+    let sid = sessionId, costUsd = 0, buf = "", stderr = "";
+    if (sid) cbs.onSession(sid);
+    child.stdout.setEncoding("utf-8");
+    child.stdout.on("data", (chunk) => {
+      buf += chunk;
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let o;
+        try {
+          o = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (o.type === "system" && o.session_id) {
+          sid = o.session_id;
+          cbs.onSession(sid);
+        } else if (o.type === "assistant" && o.message?.content) {
+          for (const block of o.message.content) {
+            if (block.type === "text" && block.text) cbs.onDelta(block.text);
+            else if (block.type === "tool_use") {
+              const tu = { name: block.name, summary: summarizeTool(block.name, block.input), callId: block.id };
+              if (block.name === "Edit" && block.input) {
+                tu.filePath = block.input.file_path || "";
+                tu.oldString = block.input.old_string || "";
+                tu.newString = block.input.new_string || "";
+                tu.replaceAll = block.input.replace_all || false;
+              } else if (block.name === "Write" && block.input) {
+                tu.filePath = block.input.file_path || "";
+                tu.content = block.input.content || "";
+              }
+              cbs.onToolUse(tu);
+            }
+          }
+        } else if (o.type === "result") {
+          if (o.session_id) sid = o.session_id;
+          costUsd = o.total_cost_usd || o.cost_usd || costUsd;
+        }
+      }
+    });
+    child.stderr.setEncoding("utf-8");
+    child.stderr.on("data", (d) => {
+      stderr += d;
+    });
+    const done = new Promise((resolve) => {
+      child.on("error", (e) => {
+        cbs.onError(e.message);
+        resolve();
+      });
+      child.on("close", (code) => {
+        if (code && code !== 0 && stderr) cbs.onError(stderr.trim().slice(0, 500));
+        cbs.onDone({ sessionId: sid, costUsd });
+        resolve();
+      });
+    });
+    return { wait: () => done, kill: () => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+      }
+    } };
+  }
+  /** Legacy `claude-call --new|--resume <id> <prompt>` CLI alias (delegates to send). */
+  call(args2) {
+    const flag = args2[0], sessionId = args2[1], prompt = args2.slice(2).join(" ");
+    if (!flag || !sessionId || !prompt) {
+      console.error("Usage: claude-call --new|--resume <session-id> <prompt>");
+      process.exit(1);
+    }
+    this.send({ mode: flag === "--new" ? "new" : "resume", sessionId, prompt, cwd: process.cwd() }).then((r) => console.log(JSON.stringify(r))).catch((e) => {
+      console.error(e.message);
+      process.exit(1);
+    });
+  }
+};
+function ts(s) {
+  return s ? new Date(s).getTime() : 0;
+}
+function parseFrontmatter(raw) {
+  const fmMatch = raw.match(/^---\n([\s\S]*?)\n---/);
+  if (!fmMatch) return {};
+  const lines = fmMatch[1].split("\n");
+  const result = {};
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    const nameMatch = line.match(/^name:\s*(.+)$/);
+    if (nameMatch) {
+      result.name = nameMatch[1].trim();
+      i++;
+      continue;
+    }
+    if (line.match(/^description:\s*\|/)) {
+      const blockLines = [];
+      i++;
+      while (i < lines.length && (lines[i].startsWith("  ") || lines[i].trim() === "")) {
+        const t = lines[i].trim();
+        if (t) blockLines.push(t);
+        i++;
+      }
+      result.description = blockLines.join(" ").slice(0, 200);
+      continue;
+    }
+    const descInlineMatch = line.match(/^description:\s*(.+)$/);
+    if (descInlineMatch) {
+      result.description = descInlineMatch[1].trim();
+      i++;
+      continue;
+    }
+    if (line.match(/^allowed-tools:\s*\|/)) {
+      const blockLines = [];
+      i++;
+      while (i < lines.length && (lines[i].startsWith("  ") || lines[i].trim() === "")) {
+        const t = lines[i].trim().replace(/^-\s*/, "");
+        if (t) blockLines.push(t);
+        i++;
+      }
+      result.allowedTools = blockLines;
+      continue;
+    }
+    const toolsInlineMatch = line.match(/^allowed-tools:\s*(.+)$/);
+    if (toolsInlineMatch) {
+      result.allowedTools = toolsInlineMatch[1].split(",").map((t) => t.trim()).filter(Boolean);
+      i++;
+      continue;
+    }
+    if (line.match(/^allowed-tools:\s*$/)) {
+      const tools = [];
+      i++;
+      while (i < lines.length && lines[i].match(/^\s*-\s/)) {
+        const t = lines[i].replace(/^\s*-\s*/, "").trim().split("#")[0].trim();
+        if (t) tools.push(t);
+        i++;
+      }
+      result.allowedTools = tools;
+      continue;
+    }
+    i++;
+  }
+  return result;
+}
+
+// src/providers/codex.ts
+var fs2 = __toESM(require("fs"));
+var path3 = __toESM(require("path"));
+var os3 = __toESM(require("os"));
+var import_child_process2 = require("child_process");
+var SOURCE2 = "codex";
+function codexItemToTool(it) {
+  if (!it || !it.type) return null;
+  switch (it.type) {
+    case "command_execution":
+      return { name: "Bash", summary: String(it.command || "command").slice(0, 100), args: String(it.command || ""), output: it.aggregated_output ? String(it.aggregated_output).slice(0, 4e3) : void 0, callId: it.id };
+    case "file_change":
+    case "patch":
+      return { name: "Edit", summary: String(it.path || it.summary || "patch").slice(0, 100), callId: it.id, output: it.diff ? String(it.diff).slice(0, 4e3) : void 0 };
+    case "mcp_tool_call":
+      return { name: it.server ? `mcp:${it.server}` : "mcp", summary: String(it.tool || it.name || "mcp").slice(0, 100), args: it.arguments ? JSON.stringify(it.arguments) : void 0, output: it.result ? String(it.result).slice(0, 4e3) : void 0, callId: it.id };
+    case "web_search":
+      return { name: "WebSearch", summary: String(it.query || "search").slice(0, 100), callId: it.id };
+    default:
+      return null;
+  }
+}
+function readLines2(f) {
+  try {
+    return fs2.readFileSync(f, "utf-8").split("\n").filter((l) => l.trim());
+  } catch {
+    return [];
+  }
+}
+function ts2(s) {
+  return s ? new Date(s).getTime() : 0;
+}
+function safeMtime(f) {
+  try {
+    return fs2.statSync(f).mtime.getTime();
+  } catch {
+    return 0;
+  }
+}
+function encode(p) {
+  return p.replace(/^\//, "").replace(/\//g, "-");
+}
+function textOf(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map((c) => c && typeof c.text === "string" ? c.text : "").join("");
+  return "";
+}
+function codexToolSummary(name, argsStr) {
+  try {
+    const a = JSON.parse(String(argsStr || "{}"));
+    return String(a.cmd || a.command || a.path || a.file_path || a.query || name || "tool").slice(0, 100);
+  } catch {
+    return name || "tool";
+  }
+}
+function idFromFile(f) {
+  const base = path3.basename(f, ".jsonl");
+  const m = base.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i);
+  return m ? m[1] : base.replace(/^rollout-/, "");
+}
+function walkRollouts(root) {
+  const out2 = [];
+  const stack = [root];
+  while (stack.length) {
+    const d = stack.pop();
+    let entries;
+    try {
+      entries = fs2.readdirSync(d, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      const full = path3.join(d, e.name);
+      if (e.isDirectory()) stack.push(full);
+      else if (e.isFile() && e.name.startsWith("rollout-") && e.name.endsWith(".jsonl")) out2.push(full);
+    }
+  }
+  return out2;
+}
+var CodexProvider = class {
+  source = SOURCE2;
+  configDir = resolveAgentDir("CODEX_HOME", ".codex");
+  get roots() {
+    return [path3.join(this.configDir, "sessions"), path3.join(this.configDir, "archived_sessions")];
+  }
+  available() {
+    return this.roots.some((r) => {
+      try {
+        return fs2.existsSync(r);
+      } catch {
+        return false;
+      }
+    });
+  }
+  nameIndex() {
+    const m = /* @__PURE__ */ new Map();
+    for (const line of readLines2(path3.join(this.configDir, "session_index.jsonl"))) {
+      try {
+        const o = JSON.parse(line);
+        if (o.id) m.set(o.id, { name: o.thread_name, updated: o.updated_at });
+      } catch {
+      }
+    }
+    return m;
+  }
+  allFiles() {
+    return this.roots.flatMap(walkRollouts);
+  }
+  metaOf(file) {
+    let cwd = "", firstPrompt = "", timestamp = "", id = idFromFile(file), messageCount = 0, model = "", effort = "", permission = "";
+    for (const line of readLines2(file)) {
+      let o;
+      try {
+        o = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const p = o.payload || {};
+      if (o.type === "session_meta") {
+        cwd = p.cwd || cwd;
+        id = p.session_id || p.id || id;
+        timestamp = o.timestamp || p.timestamp || timestamp;
+        if (p.model) model = p.model;
+      } else if (o.type === "turn_context") {
+        if (p.model) model = p.model;
+        const e = p.collaboration_mode?.settings?.reasoning_effort;
+        effort = e || "";
+        const sb = p.sandbox_policy?.type;
+        if (sb) permission = sb;
+      } else if (o.type === "response_item" && p.type === "message" && p.role === "user") {
+        messageCount++;
+        const t = textOf(p.content);
+        if (!firstPrompt && t && !t.trimStart().startsWith("<")) firstPrompt = t;
+      }
+    }
+    return { id, cwd, firstPrompt, timestamp, messageCount, model, effort, permission };
+  }
+  toSession(file, names) {
+    const meta = this.metaOf(file);
+    if (!meta.id) return null;
+    const idx = names.get(meta.id);
+    let last = idx?.updated || meta.timestamp;
+    if (!last) last = new Date(safeMtime(file)).toISOString();
+    return {
+      id: meta.id,
+      project: meta.cwd || "(unknown)",
+      encodedPath: encode(meta.cwd || ""),
+      firstPrompt: (idx?.name || meta.firstPrompt || "").slice(0, 200),
+      lastTimestamp: last,
+      messageCount: meta.messageCount,
+      source: SOURCE2,
+      name: idx?.name,
+      model: meta.model || void 0,
+      effort: meta.effort || void 0,
+      permission: meta.permission || void 0
+    };
+  }
+  /** Selectable models (slug + label + reasoning levels) from $CODEX_HOME/models_cache.json. */
+  listModels() {
+    const byslug = /* @__PURE__ */ new Map();
+    let data;
+    try {
+      data = JSON.parse(fs2.readFileSync(path3.join(this.configDir, "models_cache.json"), "utf-8"));
+    } catch {
+      return [];
+    }
+    const visit = (o) => {
+      if (!o || typeof o !== "object") return;
+      if (Array.isArray(o)) {
+        for (const x of o) visit(x);
+        return;
+      }
+      const slug = o.slug || o.id || o.model;
+      if (typeof slug === "string" && (o.supported_reasoning_levels || o.default_reasoning_level)) {
+        const efforts = Array.isArray(o.supported_reasoning_levels) ? o.supported_reasoning_levels.map((e) => e?.effort).filter(Boolean) : [];
+        if (!byslug.has(slug)) byslug.set(slug, { slug, name: o.display_name || o.displayName || slug, defaultEffort: o.default_reasoning_level, efforts });
+      }
+      for (const v of Object.values(o)) visit(v);
+    };
+    visit(data);
+    return Array.from(byslug.values());
+  }
+  listRecent(limit) {
+    if (!this.available()) return [];
+    const names = this.nameIndex();
+    const files = this.allFiles().map((f) => ({ f, m: safeMtime(f) })).sort((a, b) => b.m - a.m).slice(0, Math.max(limit, 30));
+    const out2 = [];
+    for (const { f } of files) {
+      const s = this.toSession(f, names);
+      if (s) out2.push(s);
+    }
+    return out2.sort((a, b) => ts2(b.lastTimestamp) - ts2(a.lastTimestamp)).slice(0, limit);
+  }
+  listProjects() {
+    if (!this.available()) return [];
+    const names = this.nameIndex();
+    const byCwd = /* @__PURE__ */ new Map();
+    for (const f of this.allFiles()) {
+      const s = this.toSession(f, names);
+      if (s) byCwd.set(s.project, (byCwd.get(s.project) || 0) + 1);
+    }
+    return Array.from(byCwd.entries()).map(([p, n]) => ({ path: p, encodedPath: encode(p), sessionCount: n, source: SOURCE2 }));
+  }
+  listSessions(_encodedPath) {
+    return this.listRecent(1e3);
+  }
+  listSessionsByProject(projectPath) {
+    if (!this.available()) return [];
+    const names = this.nameIndex();
+    const out2 = [];
+    for (const f of this.allFiles()) {
+      const s = this.toSession(f, names);
+      if (s && s.project === projectPath) out2.push(s);
+    }
+    return out2.sort((a, b) => ts2(b.lastTimestamp) - ts2(a.lastTimestamp));
+  }
+  readSession(_encodedPath, id) {
+    const file = this.allFiles().find((f) => idFromFile(f) === id) || this.allFiles().find((f) => f.includes(id));
+    if (!file) return [];
+    const messages = [];
+    const toolByCall = {};
+    let model = "";
+    const lastAssistant = () => {
+      for (let i = messages.length - 1; i >= 0; i--) if (messages[i].role === "assistant") return messages[i];
+      return null;
+    };
+    for (const line of readLines2(file)) {
+      let o;
+      try {
+        o = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      const p = o.payload || {};
+      if (o.type === "turn_context" && p.model) {
+        model = p.model;
+      } else if (o.type === "session_meta" && p.model && !model) {
+        model = p.model;
+      } else if (o.type === "response_item" && p.type === "message" && (p.role === "user" || p.role === "assistant")) {
+        messages.push({
+          uuid: p.id || "",
+          role: p.role,
+          content: textOf(p.content),
+          timestamp: o.timestamp || "",
+          source: SOURCE2,
+          model: p.role === "assistant" ? model || void 0 : void 0
+        });
+      } else if (o.type === "response_item" && p.type === "function_call") {
+        const tu = { name: p.name || "tool", summary: codexToolSummary(p.name, p.arguments), args: String(p.arguments || ""), callId: p.call_id };
+        if (p.call_id) toolByCall[p.call_id] = tu;
+        const a = lastAssistant();
+        if (a) (a.toolUses ||= []).push(tu);
+        else messages.push({ uuid: p.id || "", role: "assistant", content: "", timestamp: o.timestamp || "", source: SOURCE2, model: model || void 0, toolUses: [tu] });
+      } else if (o.type === "response_item" && p.type === "function_call_output") {
+        const tu = p.call_id ? toolByCall[p.call_id] : null;
+        if (tu) tu.output = String(typeof p.output === "string" ? p.output : JSON.stringify(p.output)).slice(0, 4e3);
+      }
+    }
+    return messages.filter((m) => m.content && m.content.trim() || m.toolUses && m.toolUses.length);
+  }
+  search(query, limit) {
+    if (!this.available()) return [];
+    const names = this.nameIndex();
+    const re = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    const out2 = [];
+    for (const f of this.allFiles()) {
+      if (out2.length >= limit) break;
+      let match = "";
+      for (const line of readLines2(f)) {
+        if (!re.test(line)) continue;
+        try {
+          const o = JSON.parse(line);
+          const p = o.payload || {};
+          if (p.type === "message") match = textOf(p.content);
+        } catch {
+          match = line.slice(0, 100);
+        }
+        if (match) break;
+      }
+      if (match) {
+        const s = this.toSession(f, names);
+        if (s) out2.push({ session: s, match: match.slice(0, 200) });
+      }
+    }
+    return out2;
+  }
+  // --- Send (codex exec --json; codex mints the session id and writes its own rollout) ---
+  findBin() {
+    const home = os3.homedir();
+    const envBin = (process.env.CODEX_BIN || "").trim();
+    if (envBin) {
+      try {
+        if (fs2.existsSync(envBin)) return envBin;
+      } catch {
+      }
+    }
+    try {
+      return (0, import_child_process2.execFileSync)("which", ["codex"], { encoding: "utf-8" }).trim();
+    } catch {
+    }
+    const nvmDefault = path3.join(home, ".nvm/alias/default");
+    if (fs2.existsSync(nvmDefault)) {
+      const version = fs2.readFileSync(nvmDefault, "utf-8").trim();
+      if (version) {
+        const c = path3.join(home, `.nvm/versions/node/${version}/bin/codex`);
+        if (fs2.existsSync(c)) return c;
+      }
+    }
+    const nvmVersionsDir = path3.join(home, ".nvm/versions/node");
+    if (fs2.existsSync(nvmVersionsDir)) {
+      try {
+        for (const v of fs2.readdirSync(nvmVersionsDir).sort().reverse()) {
+          const c = path3.join(nvmVersionsDir, v, "bin/codex");
+          if (fs2.existsSync(c)) return c;
+        }
+      } catch {
+      }
+    }
+    for (const c of ["/usr/local/bin/codex", "/opt/homebrew/bin/codex", path3.join(home, ".local/bin/codex")]) {
+      if (fs2.existsSync(c)) return c;
+    }
+    return "codex";
+  }
+  /**
+   * Build `codex exec` argv. New: `-s workspace-write -C <cwd>` (mirrors Claude acceptEdits).
+   * Resume: NO `-s`/`-C` (codex rejects them; it inherits the session sandbox and uses the
+   * process cwd) — the caller MUST set the spawn cwd to the session's project dir.
+   */
+  buildArgs(opts, outFile) {
+    const a = ["--json", "--skip-git-repo-check"];
+    if (outFile) a.push("-o", outFile);
+    if (opts.model) a.push("-m", opts.model);
+    if (opts.effort) a.push("-c", `model_reasoning_effort="${opts.effort}"`);
+    const yolo = opts.sandbox === "danger-full-access";
+    if (yolo) a.push("--dangerously-bypass-approvals-and-sandbox");
+    else a.push("-c", 'approval_policy="never"');
+    if (opts.mode === "resume" && opts.sessionId) return ["exec", "resume", opts.sessionId, ...a, opts.prompt];
+    const newFlags = yolo ? [] : ["-s", opts.sandbox || "workspace-write"];
+    return ["exec", ...newFlags, "-C", opts.cwd || process.cwd(), ...a, opts.prompt];
+  }
+  /** Headless blocking send. Reply from `-o` file (preferred) or the last agent_message; id from thread.started. */
+  send(opts) {
+    const outFile = path3.join(os3.tmpdir(), `codex-last-${process.pid}-${Date.now()}.txt`);
+    const args2 = this.buildArgs(opts, outFile);
+    return new Promise((resolve, reject) => {
+      const child = (0, import_child_process2.spawn)(this.findBin(), args2, { cwd: opts.cwd || process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: process.env });
+      let stdout = "", stderr = "";
+      child.stdout.setEncoding("utf-8");
+      child.stdout.on("data", (d) => {
+        stdout += d;
+      });
+      child.stderr.setEncoding("utf-8");
+      child.stderr.on("data", (d) => {
+        stderr += d;
+      });
+      child.on("error", (e) => reject(e));
+      child.on("close", (code) => {
+        let sessionId = opts.sessionId || "", response = "";
+        for (const line of stdout.split("\n")) {
+          const t = line.trim();
+          if (!t) continue;
+          let o;
+          try {
+            o = JSON.parse(t);
+          } catch {
+            continue;
+          }
+          if (o.type === "thread.started" && o.thread_id) sessionId = o.thread_id;
+          else if (o.type === "item.completed" && o.item?.type === "agent_message" && o.item.text) response = o.item.text;
+        }
+        try {
+          const f = fs2.readFileSync(outFile, "utf-8").trim();
+          if (f) response = f;
+        } catch {
+        }
+        try {
+          fs2.unlinkSync(outFile);
+        } catch {
+        }
+        if (code && code !== 0 && !response && !sessionId) {
+          reject(new Error(stderr.trim() || `codex exited with code ${code}`));
+          return;
+        }
+        resolve({ sessionId, response, costUsd: 0 });
+      });
+    });
+  }
+  /** Streaming send via `codex exec --json`; maps thread/item events onto the common callbacks. */
+  sendStreaming(opts, cbs) {
+    const args2 = this.buildArgs(opts);
+    const child = (0, import_child_process2.spawn)(this.findBin(), args2, { cwd: opts.cwd || process.cwd(), stdio: ["ignore", "pipe", "pipe"], env: process.env });
+    let sid = opts.sessionId || "", buf = "", stderr = "";
+    child.stdout.setEncoding("utf-8");
+    child.stdout.on("data", (chunk) => {
+      buf += chunk;
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        let o;
+        try {
+          o = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        if (o.type === "thread.started" && o.thread_id) {
+          sid = o.thread_id;
+          cbs.onSession(sid);
+        } else if (o.type === "item.completed" || o.type === "item.started" || o.type === "item.updated") {
+          const it = o.item;
+          if (!it) continue;
+          if (it.type === "agent_message") {
+            if (o.type === "item.completed" && it.text) cbs.onDelta(it.text);
+          } else {
+            const tu = codexItemToTool(it);
+            if (tu) cbs.onToolUse(tu);
+          }
+        }
+      }
+    });
+    child.stderr.setEncoding("utf-8");
+    child.stderr.on("data", (d) => {
+      stderr += d;
+    });
+    const done = new Promise((resolve) => {
+      child.on("error", (e) => {
+        cbs.onError(e.message);
+        resolve();
+      });
+      child.on("close", (code) => {
+        if (code && code !== 0 && stderr) cbs.onError(stderr.trim().slice(0, 500));
+        cbs.onDone({ sessionId: sid, costUsd: 0 });
+        resolve();
+      });
+    });
+    return { wait: () => done, kill: () => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+      }
+    } };
+  }
+};
+
+// src/providers/index.ts
+var _providers = null;
+function getProviders() {
+  if (!_providers) _providers = [new ClaudeProvider(), new CodexProvider()];
+  return _providers;
+}
+function getProvider(source) {
+  return getProviders().find((p) => p.source === source);
+}
+function ts3(s) {
+  return s ? new Date(s).getTime() : 0;
+}
+function aggregateRecent(limit) {
+  const all = getProviders().filter((p) => p.available()).flatMap((p) => {
+    try {
+      return p.listRecent(limit);
+    } catch {
+      return [];
+    }
+  });
+  return all.sort((a, b) => ts3(b.lastTimestamp) - ts3(a.lastTimestamp)).slice(0, limit);
+}
+function aggregateProjects() {
+  const map = /* @__PURE__ */ new Map();
+  for (const p of getProviders().filter((p2) => p2.available())) {
+    let list = [];
+    try {
+      list = p.listProjects();
+    } catch {
+      list = [];
+    }
+    for (const proj of list) {
+      const ex = map.get(proj.path);
+      if (ex) {
+        ex.sessionCount += proj.sessionCount;
+        ex.sources = Array.from(/* @__PURE__ */ new Set([...ex.sources || [], ...proj.source ? [proj.source] : []]));
+      } else {
+        map.set(proj.path, { ...proj, sources: proj.source ? [proj.source] : [] });
+      }
+    }
+  }
+  return Array.from(map.values()).sort((a, b) => b.sessionCount - a.sessionCount);
+}
+function aggregateSearch(query, limit) {
+  const out2 = [];
+  for (const p of getProviders().filter((p2) => p2.available())) {
+    if (out2.length >= limit) break;
+    try {
+      out2.push(...p.search(query, limit - out2.length));
+    } catch {
+    }
+  }
+  return out2.slice(0, limit);
+}
+function aggregateProjectSessions(projectPath) {
+  const all = getProviders().filter((p) => p.available()).flatMap((p) => {
+    try {
+      return p.listSessionsByProject(projectPath);
+    } catch {
+      return [];
+    }
+  });
+  return all.sort((a, b) => ts3(b.lastTimestamp) - ts3(a.lastTimestamp));
+}
+
+// src/history-cli.ts
+function out(v) {
+  console.log(JSON.stringify(v));
+}
+function cmdListDirs(dirPath) {
+  const resolved = dirPath.replace(/^~/, os4.homedir());
+  try {
+    if (!fs3.statSync(resolved).isDirectory()) {
+      out([]);
+      return;
+    }
+  } catch {
+    out([]);
+    return;
+  }
+  try {
+    const dirs = [];
+    for (const entry of fs3.readdirSync(resolved, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (entry.name.startsWith(".") && entry.name !== ".claude") continue;
+      dirs.push({ name: entry.name, path: path4.join(resolved, entry.name) });
+    }
+    out(dirs.sort((a, b) => a.name.localeCompare(b.name)));
+  } catch {
+    out([]);
+  }
+}
+var _argv = process.argv.slice(2);
+if (_argv[0] === "--with-env") {
+  try {
+    const cfg = JSON.parse(_argv[1] || "{}");
+    if (cfg.cwd) {
+      try {
+        process.chdir(cfg.cwd);
+      } catch {
+      }
+    }
+    if (cfg.env && typeof cfg.env === "object") for (const [k, v] of Object.entries(cfg.env)) process.env[k] = String(v);
+  } catch {
+  }
+  _argv = _argv.slice(2);
+}
+var [subcommand, ...args] = _argv;
+switch (subcommand) {
+  case "list-projects":
+    out(aggregateProjects());
+    break;
+  case "list-sessions": {
+    if (!args[0]) {
+      console.error("Usage: list-sessions <encodedPath> [source]");
+      process.exit(1);
+    }
+    const p = getProvider(args[1] || "claude-code");
+    out(p && p.available() ? p.listSessions(args[0]) : []);
+    break;
+  }
+  case "read-session": {
+    if (!args[0] || !args[1]) {
+      console.error("Usage: read-session <encodedPath> <sessionId> [source]");
+      process.exit(1);
+    }
+    const p = getProvider(args[2] || "claude-code");
+    out(p ? p.readSession(args[0], args[1]) : []);
+    break;
+  }
+  case "project-sessions":
+    if (!args[0]) {
+      console.error("Usage: project-sessions <projectPath>");
+      process.exit(1);
+    }
+    out(aggregateProjectSessions(args[0]));
+    break;
+  case "search":
+    if (!args[0]) {
+      console.error("Usage: search <query>");
+      process.exit(1);
+    }
+    out(aggregateSearch(args.join(" "), 20));
+    break;
+  case "list-recent":
+    out(aggregateRecent(args[0] ? parseInt(args[0], 10) : 30));
+    break;
+  case "list-skills":
+    out(new ClaudeProvider().listSkills());
+    break;
+  case "config": {
+    const c = new ClaudeProvider();
+    const x = getProvider("codex");
+    const codexBin = x instanceof CodexProvider ? x.findBin() : "";
+    out({ claudeConfigDir: c.configDir, codexHome: x ? x.configDir : "", claudeBin: c.findBin(), codexBin });
+    break;
+  }
+  case "claude-call":
+    new ClaudeProvider().call(args);
+    break;
+  case "list-models": {
+    const p = getProvider(args[0] || "codex");
+    out(p instanceof CodexProvider ? p.listModels() : []);
+    break;
+  }
+  case "agent-call": {
+    const source = args[0], flag = args[1], sessionId = args[2] || void 0, model = args[3] || void 0, effort = args[4] || void 0, sandbox = args[5] || void 0, prompt = args.slice(6).join(" ");
+    if (!source || !flag || !prompt) {
+      console.error("Usage: agent-call <source> --new|--resume <id> <model> <effort> <permission> <prompt>");
+      process.exit(1);
+    }
+    const p = getProvider(source);
+    if (!p) {
+      console.error(`Unknown source: ${source}`);
+      process.exit(1);
+      break;
+    }
+    p.send({ mode: flag === "--new" ? "new" : "resume", sessionId, prompt, cwd: process.cwd(), model, effort, sandbox }).then((r) => out(r)).catch((e) => {
+      console.error(e?.message || String(e));
+      process.exit(1);
+    });
+    break;
+  }
+  case "agent-stream": {
+    const source = args[0], flag = args[1], sessionId = args[2] || void 0, model = args[3] || void 0, effort = args[4] || void 0, sandbox = args[5] || void 0, prompt = args.slice(6).join(" ");
+    if (!source || !flag || !prompt) {
+      console.error("Usage: agent-stream <source> --new|--resume <id> <model> <effort> <permission> <prompt>");
+      process.exit(1);
+    }
+    const p = getProvider(source);
+    if (!p) {
+      console.error(`Unknown source: ${source}`);
+      process.exit(1);
+      break;
+    }
+    const emit = (o) => process.stdout.write(JSON.stringify(o) + "\n");
+    const handle = p.sendStreaming({ mode: flag === "--new" ? "new" : "resume", sessionId, prompt, cwd: process.cwd(), model, effort, sandbox }, {
+      onDelta: (text) => emit({ type: "delta", text }),
+      onToolUse: (tool) => emit({ type: "tool", tool }),
+      onSession: (sid) => emit({ type: "session", sessionId: sid }),
+      onDone: (r) => emit({ type: "done", ...r }),
+      onError: (message) => emit({ type: "error", message })
+    });
+    if (!handle) {
+      emit({ type: "unsupported" });
+      process.exit(0);
+      break;
+    }
+    const stop = () => {
+      try {
+        handle.kill();
+      } catch {
+      }
+    };
+    process.on("SIGTERM", stop);
+    process.on("SIGINT", stop);
+    handle.wait().then(() => {
+      process.off("SIGTERM", stop);
+      process.off("SIGINT", stop);
+      process.exitCode = 0;
+    });
+    break;
+  }
+  case "list-dirs":
+    if (!args[0]) {
+      console.error("Usage: list-dirs <path>");
+      process.exit(1);
+    }
+    cmdListDirs(args[0]);
+    break;
+  default:
+    console.error(`Unknown subcommand: ${subcommand}`);
+    console.error("Available: list-projects, list-sessions, read-session, search, list-recent, list-skills, list-models, config, claude-call, agent-call, agent-stream, list-dirs");
+    process.exit(1);
+}
