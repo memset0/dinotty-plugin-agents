@@ -1,3 +1,5 @@
+export type AgentSource = 'claude-code' | 'codex'
+
 export interface Session {
   id: string
   project: string
@@ -6,6 +8,9 @@ export interface Session {
   lastTimestamp: string
   messageCount: number
   gitBranch?: string
+  source: AgentSource
+  /** Optional human name (Codex thread_name; Claude derives from firstPrompt). */
+  name?: string
 }
 
 export interface Message {
@@ -14,6 +19,7 @@ export interface Message {
   content: string
   timestamp: string
   model?: string
+  source?: AgentSource
   toolUses?: ToolUse[]
 }
 
@@ -38,6 +44,9 @@ export interface Project {
   path: string
   encodedPath: string
   sessionCount: number
+  /** Primary source when produced by one provider; `sources` is filled when aggregated across agents. */
+  source?: AgentSource
+  sources?: AgentSource[]
 }
 
 export interface SearchResult {
