@@ -155,7 +155,9 @@ export class ClaudeProvider implements AgentProvider {
   }
 
   listSessionsByProject(projectPath: string): Session[] {
-    return this.listSessions(encodeClaude(projectPath))
+    // Match by absolute cwd (robust to dir-name encoding); reuse the real dir name.
+    const proj = this.listProjects().find(p => p.path === projectPath)
+    return proj ? this.listSessions(proj.encodedPath) : []
   }
 
   readSession(encodedPath: string, sessionId: string): Message[] {

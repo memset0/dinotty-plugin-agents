@@ -1,7 +1,7 @@
 import type { PluginContext, PluginExports } from '../../plugin-api/index'
 import type { Session, Message, Project, SearchResult, FileChange, ToolUse } from './types'
 import { aggregateFileChanges, computeEditDiff, type DiffLine } from './diff'
-import { listProjects, listSessions, projectSessions, readSession, searchSessions, listRecentSessions, listSkills, listDirs } from './history'
+import { listProjects, listSessions, projectSessions, readSession, searchSessions, listRecentSessions, listSkills, listDirs, getConfig } from './history'
 import { createConversation, continueConversation } from './claude'
 import {
   initIcons,
@@ -192,22 +192,29 @@ export function activate(ctx: PluginContext): PluginExports {
     return ctx.exec.run(args, { ...options, env: { ...settingsEnv(), ...(options?.env || {}) } })
   }
   async function loadSettings() {
-    try {
-      const saved = await ctx.storage.get<any>('settings')
-      if (saved && typeof saved === 'object') {
-        settings.value = {
-          claudeConfigDir: saved.claudeConfigDir || '',
-          codexHome: saved.codexHome || '',
-          claudeBin: saved.claudeBin || '',
-        }
-      }
-    } catch { /* use defaults */ }
+    let saved: any = {}
+    try { saved = (await ctx.storage.get<any>('settings')) || {} } catch { /* */ }
+    // Prefill empty fields with the actually-resolved defaults (so the panel
+    // shows what's being used, not blanks).
+    let def = { claudeConfigDir: '', codexHome: '', claudeBin: '' }
+    try { def = await getConfig(exec) } catch { /* */ }
+    settings.value = {
+      claudeConfigDir: saved.claudeConfigDir || def.claudeConfigDir || '',
+      codexHome: saved.codexHome || def.codexHome || '',
+      claudeBin: saved.claudeBin || def.claudeBin || '',
+    }
+  }
+  async function refreshLists() {
+    loadRecentSessions()
+    loadProjects()
+    if (selectedProject.value) {
+      try { sessions.value = await projectSessions(exec, selectedProject.value) } catch { /* */ }
+    }
   }
   async function saveSettings() {
     try { await ctx.storage.set('settings', settings.value) } catch { /* ignore */ }
     showSettings.value = false
-    loadRecentSessions()
-    loadProjects()
+    refreshLists()
   }
 
   // Source badge: distinguishes Claude Code vs Codex sessions.
@@ -567,11 +574,10 @@ export function activate(ctx: PluginContext): PluginExports {
             onClick: () => { sidebarTab.value = 'search' },
           }, 'Search'),
         ]),
-        h('button', {
-          class: 'ccm-icon-btn ccm-icon-btn-sm',
-          onClick: startNewChat,
-          title: 'New conversation',
-        }, IconPlus()),
+        h('div', { style: 'display:flex;gap:4px' }, [
+          h('button', { class: 'ccm-icon-btn ccm-icon-btn-sm', onClick: () => refreshLists(), title: 'Refresh' }, IconRefresh(14)),
+          h('button', { class: 'ccm-icon-btn ccm-icon-btn-sm', onClick: startNewChat, title: 'New conversation' }, IconPlus()),
+        ]),
       ]),
       sidebarTab.value === 'history' ? renderHistoryPanel() : renderSearchPanel(),
     ])
@@ -579,7 +585,7 @@ export function activate(ctx: PluginContext): PluginExports {
 
   function renderHistoryPanel() {
     return h('div', { class: 'ccm-sidebar-body' }, [
-      loading.value ? h('div', { class: 'ccm-sidebar-loading' }, [
+      loading.value && !selectedProject.value ? h('div', { class: 'ccm-sidebar-loading' }, [
         h('span', { class: 'ccm-spinner' }),
       ]) : null,
       ...projects.value.map(p => h('div', { class: 'ccm-project-group' }, [
@@ -593,6 +599,7 @@ export function activate(ctx: PluginContext): PluginExports {
           h('span', { class: 'ccm-project-count' }, String(p.sessionCount)),
         ]),
         selectedProject.value === p.path ? h('div', { class: 'ccm-session-list' },
+          loading.value ? [h('div', { class: 'ccm-sidebar-loading' }, [h('span', { class: 'ccm-spinner' })])] :
           sessions.value.map(s => h('div', {
             class: `ccm-session-row ${activeSession.value?.id === s.id ? 'ccm-session-row-active' : ''}`,
             onClick: () => openSession(s),
@@ -1199,23 +1206,32 @@ export function activate(ctx: PluginContext): PluginExports {
           onInput: (e: Event) => { settings.value = { ...settings.value, [key]: (e.target as HTMLInputElement).value } },
         }),
       ])
+    const section = (title: string, children: any[]) =>
+      h('div', { style: 'margin-bottom:18px' }, [
+        h('div', { style: 'font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;opacity:.55;margin-bottom:8px' }, title),
+        ...children,
+      ])
     return h('div', { class: 'ccm-picker-overlay' }, [
       h('div', { class: 'ccm-picker-backdrop', onClick: () => { showSettings.value = false } }),
-      h('div', { class: 'ccm-picker-panel' }, [
+      h('div', { class: 'ccm-picker-panel', style: 'max-height:82vh;display:flex;flex-direction:column' }, [
         h('div', { class: 'ccm-picker-header' }, [
           h('span', { class: 'ccm-picker-title' }, 'Settings'),
           h('button', { class: 'ccm-icon-btn ccm-icon-btn-sm', onClick: () => { showSettings.value = false } }, IconX(14)),
         ]),
-        h('div', { style: 'padding:14px' }, [
-          field('Claude config dir (CLAUDE_CONFIG_DIR)', 'claudeConfigDir', '~/.claude or /root/.claude'),
-          field('Codex home (CODEX_HOME)', 'codexHome', '~/.codex'),
-          field('Claude binary (CLAUDE_BIN)', 'claudeBin', 'auto-detect if empty'),
-          h('div', { style: 'font-size:11px;opacity:.55;margin-bottom:12px;line-height:1.5' },
-            'Empty = use the env var / default. Reading another user’s dir (e.g. /root/.claude) requires the dinotty user to have FS read access (ACL grant).'),
-          h('div', { style: 'display:flex;gap:8px;justify-content:flex-end' }, [
-            h('button', { class: 'ccm-icon-btn', onClick: () => { showSettings.value = false } }, 'Cancel'),
-            h('button', { class: 'ccm-primary-btn ccm-primary-btn-sm', onClick: () => saveSettings() }, 'Save'),
+        h('div', { style: 'padding:14px;overflow:auto;flex:1 1 auto' }, [
+          section('Claude Code', [
+            field('Config dir (CLAUDE_CONFIG_DIR)', 'claudeConfigDir', '~/.claude'),
+            field('Binary (CLAUDE_BIN)', 'claudeBin', 'auto-detect if empty'),
           ]),
+          section('Codex', [
+            field('Home (CODEX_HOME)', 'codexHome', '~/.codex'),
+          ]),
+          h('div', { style: 'font-size:11px;opacity:.55;line-height:1.5' },
+            'Prefilled with the values currently in use. Reading another user’s dir (e.g. /root/.claude) requires the dinotty process to have read access — run dinotty as that user, or grant an ACL.'),
+        ]),
+        h('div', { style: 'display:flex;gap:8px;justify-content:flex-end;padding:12px 14px;border-top:1px solid var(--border-color,rgba(255,255,255,.08));flex:0 0 auto' }, [
+          h('button', { class: 'ccm-icon-btn', onClick: () => { showSettings.value = false } }, 'Cancel'),
+          h('button', { class: 'ccm-primary-btn ccm-primary-btn-sm', onClick: () => saveSettings() }, 'Save & Refresh'),
         ]),
       ]),
     ])

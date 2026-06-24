@@ -26,6 +26,15 @@ export async function projectSessions(exec: ExecFn, projectPath: string): Promis
   return JSON.parse(res.stdout)
 }
 
+/** Resolved-in-use config dirs / binary (for prefilling the settings panel). */
+export async function getConfig(exec: ExecFn): Promise<{ claudeConfigDir: string; codexHome: string; claudeBin: string }> {
+  try {
+    const res = await exec(['config'])
+    if (res.code === 0) return JSON.parse(res.stdout)
+  } catch { /* fall through */ }
+  return { claudeConfigDir: '', codexHome: '', claudeBin: '' }
+}
+
 export async function searchSessions(exec: ExecFn, query: string): Promise<SearchResult[]> {
   const res = await exec(['search', query])
   if (res.code !== 0) throw new Error(res.stderr || 'search failed')

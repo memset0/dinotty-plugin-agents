@@ -56,6 +56,12 @@ switch (subcommand) {
   case 'list-skills':
     out(new ClaudeProvider().listSkills())
     break
+  case 'config': {
+    const c = new ClaudeProvider()
+    const x = getProvider('codex')
+    out({ claudeConfigDir: c.configDir, codexHome: x ? x.configDir : '', claudeBin: c.findBin() })
+    break
+  }
   case 'claude-call':
     new ClaudeProvider().call(args)
     break
