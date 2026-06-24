@@ -56,6 +56,8 @@ export function activate(ctx: PluginContext): PluginExports {
   const pickerLoading = ctx.ref(false)
   const showSettings = ctx.ref(false)
   const settings = ctx.ref<{ claudeConfigDir: string; codexHome: string; claudeBin: string }>({ claudeConfigDir: '', codexHome: '', claudeBin: '' })
+  const favProjects = ctx.ref<Set<string>>(new Set())
+  const favSessions = ctx.ref<Set<string>>(new Set())
 
   // --- Computed ---
   const fileChanges = ctx.computed(() => aggregateFileChanges(messages.value))
@@ -215,6 +217,40 @@ export function activate(ctx: PluginContext): PluginExports {
     try { await ctx.storage.set('settings', settings.value) } catch { /* ignore */ }
     showSettings.value = false
     refreshLists()
+  }
+
+  // --- Favorites (local only, via ctx.storage — not synced through mem.conf) ---
+  async function loadFavorites() {
+    try {
+      const f = await ctx.storage.get<any>('favorites')
+      if (f && typeof f === 'object') {
+        favProjects.value = new Set(Array.isArray(f.projects) ? f.projects : [])
+        favSessions.value = new Set(Array.isArray(f.sessions) ? f.sessions : [])
+      }
+    } catch { /* */ }
+  }
+  function persistFavorites() {
+    ctx.storage.set('favorites', { projects: [...favProjects.value], sessions: [...favSessions.value] }).catch(() => {})
+  }
+  function toggleFavProject(path: string) {
+    const s = new Set(favProjects.value); s.has(path) ? s.delete(path) : s.add(path); favProjects.value = s; persistFavorites()
+  }
+  function toggleFavSession(id: string) {
+    const s = new Set(favSessions.value); s.has(id) ? s.delete(id) : s.add(id); favSessions.value = s; persistFavorites()
+  }
+  // Stable sort: starred first, original order preserved within each group.
+  function sortProjectsByFav(list: Project[]): Project[] {
+    return [...list].sort((a, b) => (favProjects.value.has(b.path) ? 1 : 0) - (favProjects.value.has(a.path) ? 1 : 0))
+  }
+  function sortSessionsByFav(list: Session[]): Session[] {
+    return [...list].sort((a, b) => (favSessions.value.has(b.id) ? 1 : 0) - (favSessions.value.has(a.id) ? 1 : 0))
+  }
+  function starBtn(active: boolean, onToggle: () => void) {
+    return h('span', {
+      onClick: (e: Event) => { e.stopPropagation(); onToggle() },
+      title: active ? 'Unstar' : 'Star',
+      style: `cursor:pointer;font-size:13px;line-height:1;margin:0 2px;${active ? 'color:#f5c518' : 'opacity:.35'}`,
+    }, active ? '★' : '☆')
   }
 
   // Source badge: distinguishes Claude Code vs Codex sessions.
@@ -588,7 +624,7 @@ export function activate(ctx: PluginContext): PluginExports {
       loading.value && !selectedProject.value ? h('div', { class: 'ccm-sidebar-loading' }, [
         h('span', { class: 'ccm-spinner' }),
       ]) : null,
-      ...projects.value.map(p => h('div', { class: 'ccm-project-group' }, [
+      ...sortProjectsByFav(projects.value).map(p => h('div', { class: 'ccm-project-group' }, [
         h('div', {
           class: `ccm-project-header ${selectedProject.value === p.path ? 'ccm-project-header-active' : ''}`,
           onClick: () => selectProject(p),
@@ -596,16 +632,18 @@ export function activate(ctx: PluginContext): PluginExports {
           h('span', { class: 'ccm-project-chevron' }, selectedProject.value === p.path ? IconChevronDown(12) : IconChevronRight(12)),
           h('span', { class: 'ccm-project-icon' }, IconFolder(14)),
           h('span', { class: 'ccm-project-label' }, p.path.split('/').pop() || p.path),
+          starBtn(favProjects.value.has(p.path), () => toggleFavProject(p.path)),
           h('span', { class: 'ccm-project-count' }, String(p.sessionCount)),
         ]),
         selectedProject.value === p.path ? h('div', { class: 'ccm-session-list' },
           loading.value ? [h('div', { class: 'ccm-sidebar-loading' }, [h('span', { class: 'ccm-spinner' })])] :
-          sessions.value.map(s => h('div', {
+          sortSessionsByFav(sessions.value).map(s => h('div', {
             class: `ccm-session-row ${activeSession.value?.id === s.id ? 'ccm-session-row-active' : ''}`,
             onClick: () => openSession(s),
           }, [
             h('div', { class: 'ccm-session-text' }, (s.name || s.firstPrompt || '').slice(0, 50) || '(empty)'),
             h('div', { class: 'ccm-session-info' }, [
+              starBtn(favSessions.value.has(s.id), () => toggleFavSession(s.id)),
               srcBadge(s.source),
               h('span', null, formatTime(s.lastTimestamp)),
               s.gitBranch ? h('span', { class: 'ccm-tag' }, s.gitBranch) : null,
@@ -1169,6 +1207,7 @@ export function activate(ctx: PluginContext): PluginExports {
       setup() {
         ctx.onMounted(() => {
           console.log('[agents-view] onMounted called')
+          loadFavorites()
           loadSettings().then(() => { loadRecentSessions(); loadProjects() })
           // Pre-load skills for slash command palette
           listSkills(exec).then(s => { skillsList.value = s }).catch(() => {})
@@ -1238,7 +1277,7 @@ export function activate(ctx: PluginContext): PluginExports {
   }
 
   function renderBrowseView() {
-    const filtered = getFilteredSessions()
+    const filtered = sortSessionsByFav(getFilteredSessions())
     return h('div', { class: 'ccm-browse' }, [
       // Header bar (Claudix SessionsPage style)
       h('div', { class: 'ccm-browse-header' }, [
@@ -1319,6 +1358,7 @@ export function activate(ctx: PluginContext): PluginExports {
         h('span', { class: 'ccm-session-card-time' }, formatTime(s.lastTimestamp)),
       ]),
       h('div', { class: 'ccm-session-card-meta' }, [
+        starBtn(favSessions.value.has(s.id), () => toggleFavSession(s.id)),
         srcBadge(s.source),
         h('span', { class: 'ccm-session-card-count' }, `${s.messageCount} messages`),
         h('span', { class: 'ccm-tag' }, s.project.split('/').pop() || s.project),
