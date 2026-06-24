@@ -324,7 +324,6 @@ export function activate(ctx: PluginContext): PluginExports {
   async function openSession(session: Session) {
     activeSession.value = session
     view.value = 'chat'
-    sidebarOpen.value = false
     loading.value = true
     error.value = null
     messages.value = []
