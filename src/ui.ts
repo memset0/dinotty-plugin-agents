@@ -8,7 +8,7 @@ import {
   IconSearch, IconRefresh, IconPlus, IconX, IconChevronRight, IconChevronDown,
   IconArrowLeft, IconSend, IconMenu, IconBrain, IconCopy, IconCheck,
   IconFolder, IconZap, IconHash, IconTerminal, IconFileText, IconPencil,
-  IconEye, IconGlobe, IconSettings, IconMessageSquare, IconSquarePen, IconClaude, IconUser,
+  IconEye, IconGlobe, IconSettings, IconMessageSquare, IconSquarePen, IconClaude, IconUser, IconHome,
 } from './icons'
 
 export function activate(ctx: PluginContext): PluginExports {
@@ -697,11 +697,12 @@ export function activate(ctx: PluginContext): PluginExports {
   }
 
   // --- Commands ---
-  ctx.commands.register('agents-view.open', () => {
+  function openBrowse() {
     view.value = 'browse'
     sidebarOpen.value = true
     loadProjects()
-  })
+  }
+  ctx.commands.register('agents-view.open', openBrowse)
   ctx.commands.register('agents-view.new', () => startNewChat())
   ctx.commands.register('agents-view.search', () => {
     sidebarOpen.value = true
@@ -739,7 +740,6 @@ export function activate(ctx: PluginContext): PluginExports {
         ),
       ]),
       h('div', { class: 'ccm-header-right' }, [
-        h('button', { class: 'ccm-icon-btn', onClick: () => { showSettings.value = true }, title: 'Settings' }, IconSettings(16)),
         costTotal.value > 0 ? h('span', { class: 'ccm-cost-badge' }, `$${costTotal.value.toFixed(3)}`) : null,
         fileChanges.value.length > 0 ? h('button', {
           class: `ccm-icon-btn ${changesPanelOpen.value ? 'ccm-icon-btn-active' : ''}`,
@@ -751,6 +751,12 @@ export function activate(ctx: PluginContext): PluginExports {
           onClick: startNewChat,
           title: 'New conversation',
         }, IconPlus()),
+        h('button', {
+          class: 'ccm-icon-btn',
+          onClick: openBrowse,
+          title: 'All sessions',
+        }, IconHome(16)),
+        h('button', { class: 'ccm-icon-btn', onClick: () => { showSettings.value = true }, title: 'Settings' }, IconSettings(16)),
       ].filter(Boolean)),
     ])
   }

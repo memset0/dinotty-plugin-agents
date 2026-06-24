@@ -83,6 +83,10 @@ const ICON_PATHS: Record<string, [string, Record<string, string>][]> = {
     ['path', { d: 'M12 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7' }],
     ['path', { d: 'M18.375 2.625a1 1 0 0 1 3 3l-9.013 9.014a2 2 0 0 1-.853.505l-2.873.84a.5.5 0 0 1-.62-.62l.84-2.873a2 2 0 0 1 .506-.852z' }],
   ],
+  home: [
+    ['path', { d: 'm3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z' }],
+    ['path', { d: 'M9 22V12h6v10' }],
+  ],
 }
 
 // ClaudeCode icon from lobe-icons (fill-based SVG, not stroke)
@@ -146,6 +150,7 @@ export function IconSettings(size?: number) { return renderIcon(ICON_PATHS.setti
 export function IconMessageSquare(size?: number) { return renderIcon(ICON_PATHS['message-square'], size) }
 export function IconSquarePen(size?: number) { return renderIcon(ICON_PATHS['square-pen'], size) }
 export function IconUser(size?: number) { return renderIcon(ICON_PATHS['user'], size) }
+export function IconHome(size?: number) { return renderIcon(ICON_PATHS.home, size) }
 
 // ClaudeCode icon from lobe-icons (fill-based, not stroke)
 export function IconClaude(size?: number, cls?: string) { return renderFillIcon(CLAUDE_CODE_PATH, size, cls) }
