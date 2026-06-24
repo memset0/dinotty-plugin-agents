@@ -69,7 +69,7 @@ export function activate(ctx: PluginContext): PluginExports {
   interface SlashCmd { name: string; desc: string; action: () => void }
   const slashCommands: SlashCmd[] = [
     { name: '/new', desc: 'Start a new conversation', action: startNewChat },
-    { name: '/open', desc: 'Open Claude Code', action: () => { view.value = 'browse'; sidebarOpen.value = true; loadProjects() } },
+    { name: '/open', desc: 'Open Agents View', action: () => { view.value = 'browse'; sidebarOpen.value = true; loadProjects() } },
     { name: '/history', desc: 'Show conversation history', action: () => { sidebarOpen.value = true; sidebarTab.value = 'history'; loadProjects() } },
     { name: '/search', desc: 'Search conversations', action: () => { sidebarOpen.value = true; sidebarTab.value = 'search' } },
     { name: '/skills', desc: 'List available skills', action: loadAndShowSkills },
@@ -214,18 +214,18 @@ export function activate(ctx: PluginContext): PluginExports {
   async function loadRecentSessions() {
     loading.value = true
     error.value = null
-    console.log('[claude-code] loadRecentSessions: starting')
+    console.log('[agents-view] loadRecentSessions: starting')
     try {
       const result = await exec(['list-recent', '30'], { timeout: 15_000 })
-      console.log('[claude-code] list-recent result:', result.code, result.stdout?.length, result.stderr?.slice(0, 200))
+      console.log('[agents-view] list-recent result:', result.code, result.stdout?.length, result.stderr?.slice(0, 200))
       if (result.code !== 0) {
         throw new Error(result.stderr || 'list-recent failed')
       }
       const parsed = JSON.parse(result.stdout)
-      console.log('[claude-code] parsed sessions:', parsed.length)
+      console.log('[agents-view] parsed sessions:', parsed.length)
       recentSessions.value = parsed
     } catch (e: any) {
-      console.error('[claude-code] loadRecentSessions error:', e.message)
+      console.error('[agents-view] loadRecentSessions error:', e.message)
       // Fallback: load sessions from each project
       try {
         if (projects.value.length === 0) {
@@ -250,9 +250,9 @@ export function activate(ctx: PluginContext): PluginExports {
           return tb - ta
         })
         recentSessions.value = all.slice(0, 30)
-        console.log('[claude-code] fallback loaded:', all.length, 'sessions')
+        console.log('[agents-view] fallback loaded:', all.length, 'sessions')
       } catch (e2: any) {
-        console.error('[claude-code] fallback error:', e2.message)
+        console.error('[agents-view] fallback error:', e2.message)
         error.value = `Failed to load sessions: ${e.message}`
       }
     } finally {
@@ -437,20 +437,20 @@ export function activate(ctx: PluginContext): PluginExports {
   }
 
   // --- Commands ---
-  ctx.commands.register('claude-code.open', () => {
+  ctx.commands.register('agents-view.open', () => {
     view.value = 'browse'
     sidebarOpen.value = true
     loadProjects()
   })
-  ctx.commands.register('claude-code.new', () => startNewChat())
-  ctx.commands.register('claude-code.search', () => {
+  ctx.commands.register('agents-view.new', () => startNewChat())
+  ctx.commands.register('agents-view.search', () => {
     sidebarOpen.value = true
     sidebarTab.value = 'search'
     loadProjects()
   })
 
-  ctx.commands.registerQuickPick('claude-code.quick', {
-    title: 'Claude Code — Switch Session',
+  ctx.commands.registerQuickPick('agents-view.quick', {
+    title: 'Agents View — Switch Session',
     async items() {
       const recent = await listRecentSessions(exec, 20)
       return recent.map(s => ({
@@ -475,7 +475,7 @@ export function activate(ctx: PluginContext): PluginExports {
         h('span', { class: 'ccm-header-title' },
           activeSession.value
             ? (activeSession.value.firstPrompt?.slice(0, 60) || 'Session')
-            : (view.value === 'chat' ? 'New Chat' : 'Claude Code')
+            : (view.value === 'chat' ? 'New Chat' : 'Agents View')
         ),
       ]),
       h('div', { class: 'ccm-header-right' }, [
@@ -599,7 +599,7 @@ export function activate(ctx: PluginContext): PluginExports {
     return h('div', { class: 'ccm-empty' }, [
       h('div', { class: 'ccm-empty-logo' }, IconClaude(48)),
       h('div', { class: 'ccm-empty-heading' }, activeSession.value ? 'Loading conversation...' : 'Start a new conversation'),
-      h('div', { class: 'ccm-empty-sub' }, activeSession.value ? '' : 'Type a message below to chat with Claude Code'),
+      h('div', { class: 'ccm-empty-sub' }, activeSession.value ? '' : 'Type a message below to start chatting with your agent'),
     ])
   }
 
@@ -684,7 +684,7 @@ export function activate(ctx: PluginContext): PluginExports {
       h('div', { class: 'ccm-input-container' }, [
         h('textarea', {
           class: 'ccm-input',
-          placeholder: activeSession.value ? 'Continue the conversation...  (type / for commands)' : 'Ask Claude Code anything...  (type / for commands)',
+          placeholder: activeSession.value ? 'Continue the conversation...  (type / for commands)' : 'Ask your agent anything...  (type / for commands)',
           value: inputText.value,
           onInput: (e: Event) => {
             inputText.value = (e.target as HTMLTextAreaElement).value
@@ -878,7 +878,7 @@ export function activate(ctx: PluginContext): PluginExports {
       h('div', { class: 'ccm-statusbar-left' }, [
         h('span', { class: 'ccm-statusbar-item' }, [
           IconClaude(12),
-          h('span', null, ' Claude Code'),
+          h('span', null, ' Agents View'),
         ]),
         activeSession.value ? h('span', { class: 'ccm-statusbar-sep' }, '|') : null,
         activeSession.value ? h('span', { class: 'ccm-statusbar-item ccm-statusbar-muted' },
@@ -1089,7 +1089,7 @@ export function activate(ctx: PluginContext): PluginExports {
     component: {
       setup() {
         ctx.onMounted(() => {
-          console.log('[claude-code] onMounted called')
+          console.log('[agents-view] onMounted called')
           loadRecentSessions()
           loadProjects()
           // Pre-load skills for slash command palette
