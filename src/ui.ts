@@ -1,5 +1,5 @@
 import type { PluginContext, PluginExports } from '../../plugin-api/index'
-import type { Session, Message, Project, SearchResult, FileChange } from './types'
+import type { Session, Message, Project, SearchResult, FileChange, ToolUse } from './types'
 import { aggregateFileChanges, computeEditDiff, type DiffLine } from './diff'
 import { listProjects, listSessions, projectSessions, readSession, searchSessions, listRecentSessions, listSkills, listDirs } from './history'
 import { createConversation, continueConversation } from './claude'
@@ -668,7 +668,7 @@ export function activate(ctx: PluginContext): PluginExports {
       ]),
       h('div', { class: 'ccm-message-body' }, [
         h('div', { class: 'ccm-message-meta' }, [
-          h('span', { class: 'ccm-message-role' }, isUser ? 'You' : 'Claude'),
+          h('span', { class: 'ccm-message-role' }, isUser ? 'You' : (msg.source === 'codex' ? 'Codex' : 'Claude')),
           msg.model ? h('span', { class: 'ccm-model-tag' }, msg.model) : null,
           h('span', { class: 'ccm-message-time' }, formatTime(msg.timestamp)),
         ].filter(Boolean)),
@@ -682,9 +682,11 @@ export function activate(ctx: PluginContext): PluginExports {
     ])
   }
 
-  function renderToolCard(msgId: string, tool: { name: string; summary: string }, index: number) {
+  function renderToolCard(msgId: string, tool: ToolUse, index: number) {
     const key = `${msgId}-${index}`
     const expanded = expandedTools.value.has(key)
+    const preStyle = 'white-space:pre-wrap;word-break:break-word;overflow:auto;max-height:240px;margin:0;font-size:12px'
+    const labelStyle = 'opacity:.55;font-size:11px;margin:0 0 2px'
 
     return h('div', { class: `ccm-tool-card ${expanded ? 'ccm-tool-card-expanded' : ''}` }, [
       h('div', {
@@ -697,8 +699,16 @@ export function activate(ctx: PluginContext): PluginExports {
         h('span', { class: 'ccm-tool-chevron' }, expanded ? IconChevronDown(12) : IconChevronRight(12)),
       ]),
       expanded ? h('div', { class: 'ccm-tool-detail' }, [
-        h('code', null, `${tool.name}: ${tool.summary}`),
-      ]) : null,
+        tool.args ? h('div', { class: 'ccm-tool-block' }, [
+          h('div', { style: labelStyle }, 'Call'),
+          h('pre', { style: preStyle }, tool.args),
+        ]) : null,
+        tool.output != null ? h('div', { class: 'ccm-tool-block', style: 'margin-top:6px' }, [
+          h('div', { style: labelStyle }, 'Output'),
+          h('pre', { style: preStyle }, tool.output),
+        ]) : null,
+        (!tool.args && tool.output == null) ? h('code', null, `${tool.name}: ${tool.summary}`) : null,
+      ].filter(Boolean)) : null,
     ])
   }
 

@@ -16,6 +16,12 @@ function textOf(content: any): string {
   if (Array.isArray(content)) return content.map((c: any) => (c && typeof c.text === 'string') ? c.text : '').join('')
   return ''
 }
+function codexToolSummary(name: string, argsStr: any): string {
+  try {
+    const a = JSON.parse(String(argsStr || '{}'))
+    return String(a.cmd || a.command || a.path || a.file_path || a.query || name || 'tool').slice(0, 100)
+  } catch { return name || 'tool' }
+}
 function idFromFile(f: string): string {
   const base = path.basename(f, '.jsonl')
   const m = base.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i)
@@ -114,19 +120,34 @@ export class CodexProvider implements AgentProvider {
     const file = this.allFiles().find(f => idFromFile(f) === id) || this.allFiles().find(f => f.includes(id))
     if (!file) return []
     const messages: Message[] = []
+    const toolByCall: Record<string, ToolUse> = {}
+    let model = ''
+    const lastAssistant = (): Message | null => {
+      for (let i = messages.length - 1; i >= 0; i--) if (messages[i].role === 'assistant') return messages[i]
+      return null
+    }
     for (const line of readLines(file)) {
       let o: any; try { o = JSON.parse(line) } catch { continue }
       const p = o.payload || {}
-      if (o.type === 'response_item' && p.type === 'message' && (p.role === 'user' || p.role === 'assistant')) {
-        messages.push({ uuid: p.id || '', role: p.role, content: textOf(p.content), timestamp: o.timestamp || '', source: SOURCE })
+      if (o.type === 'turn_context' && p.model) { model = p.model }
+      else if (o.type === 'session_meta' && p.model && !model) { model = p.model }
+      else if (o.type === 'response_item' && p.type === 'message' && (p.role === 'user' || p.role === 'assistant')) {
+        messages.push({
+          uuid: p.id || '', role: p.role, content: textOf(p.content), timestamp: o.timestamp || '',
+          source: SOURCE, model: p.role === 'assistant' ? (model || undefined) : undefined,
+        })
       } else if (o.type === 'response_item' && p.type === 'function_call') {
-        const tu: ToolUse = { name: p.name || 'tool', summary: String(p.arguments || '').slice(0, 80) }
-        const last = messages[messages.length - 1]
-        if (last && last.role === 'assistant') (last.toolUses ||= []).push(tu)
-        else messages.push({ uuid: p.id || '', role: 'assistant', content: '', timestamp: o.timestamp || '', source: SOURCE, toolUses: [tu] })
+        const tu: ToolUse = { name: p.name || 'tool', summary: codexToolSummary(p.name, p.arguments), args: String(p.arguments || ''), callId: p.call_id }
+        if (p.call_id) toolByCall[p.call_id] = tu
+        const a = lastAssistant()
+        if (a) (a.toolUses ||= []).push(tu)
+        else messages.push({ uuid: p.id || '', role: 'assistant', content: '', timestamp: o.timestamp || '', source: SOURCE, model: model || undefined, toolUses: [tu] })
+      } else if (o.type === 'response_item' && p.type === 'function_call_output') {
+        const tu = p.call_id ? toolByCall[p.call_id] : null
+        if (tu) tu.output = String(typeof p.output === 'string' ? p.output : JSON.stringify(p.output)).slice(0, 4000)
       }
     }
-    return messages
+    return messages.filter(m => (m.content && m.content.trim()) || (m.toolUses && m.toolUses.length))
   }
 
   search(query: string, limit: number): SearchResult[] {

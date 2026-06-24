@@ -31,6 +31,12 @@ export interface ToolUse {
   newString?: string
   content?: string
   replaceAll?: boolean
+  /** Raw call arguments (e.g. Codex function_call.arguments JSON). */
+  args?: string
+  /** Tool result (e.g. Codex function_call_output, paired by callId). */
+  output?: string
+  /** Pairing id for call ↔ output (Codex). */
+  callId?: string
 }
 
 export interface FileChange {
